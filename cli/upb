@@ -866,6 +866,56 @@ def _generate_router_env(cfg, secrets):
     return local_secret
 
 
+def discover_new_models(cfg):
+    """For providers flagged `discover: true`, report upstream models not yet in routes.yaml.
+
+    Report-only — never edits routes.yaml. Intended for rotating catalogs such as
+    OpenCode Zen's free tier, where new models appear over time.
+    """
+    targets = []
+    for pname, prov in sorted_providers(cfg):
+        if not prov.get("enabled", True):
+            continue
+        if not prov.get("discover"):
+            continue
+        if is_catalog(prov):
+            continue  # live-catalog providers already auto-discover
+        if not prov.get("base_url"):
+            continue
+        targets.append((pname, prov))
+    if not targets:
+        return
+    print("\nModel discovery (providers with discover: true):")
+    for pname, prov in targets:
+        key, desc = resolve_key(prov.get("key"))
+        if key is None:
+            print(f"  {pname}: skipped — key unavailable ({desc})")
+            continue
+        configured = set((prov.get("models") or {}).keys())
+        match = prov.get("discover_match")  # optional substring filter for reported models
+        url = prov["base_url"].rstrip("/") + "/models"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "upb-discover/1.0"})
+            if key:
+                req.add_header("Authorization", f"Bearer {key}")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            available = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        except Exception as e:
+            print(f"  {pname}: discovery failed ({type(e).__name__})")
+            continue
+        new_models = [m for m in available if m not in configured]
+        if match:
+            new_models = [m for m in new_models if match in m]
+        if new_models:
+            print(f"  {pname}: {len(new_models)} NEW upstream model(s) not in routes.yaml:")
+            for m in new_models:
+                print(f"      + {m}")
+            print(f"      add under providers.{pname}.models in routes.yaml to enable")
+        else:
+            print(f"  {pname}: up to date ({len(configured)} configured / {len(available)} upstream)")
+
+
 def cmd_sync(cfg, args):
     """Sync secrets: pull from source stores → secrets.env → push to derived files."""
     import re as _re
@@ -970,6 +1020,10 @@ def cmd_sync(cfg, args):
             else:
                 print(f"  • {short_path(router_env)} already in sync")
 
+    # ── Model discovery: report new upstream models for discover:true providers ──
+    if not getattr(args, "no_discover", False):
+        discover_new_models(cfg)
+
     return 0
 
 
@@ -1003,6 +1057,8 @@ def main():
     p_sync = sub.add_parser("sync")
     p_sync.add_argument("--full", action="store_true",
                         help="force full regeneration of router.env")
+    p_sync.add_argument("--no-discover", action="store_true",
+                        help="skip the new-model discovery check")
     sub.add_parser("env")
 
     args = parser.parse_args(argv)

@@ -71,6 +71,9 @@ providers:
     local_secret: claude-zen-poser
     priority: 30
     enabled: true
+    # discover: report new upstream models matching discover_match during upb sync
+    discover: true
+    discover_match: free
     models:
       deepseek-v4-flash-free:
         port: 8801
