@@ -162,12 +162,22 @@ never removed automatically — the uninstaller prints how to restore it from th
 ## Repository layout
 
 ```
-router/    TypeScript dual-intake proxy (src/, package.json, tsconfig.json)
-cli/       upb — Python route-control CLI
-config/    Example config (routes.yaml, secrets.env, systemd service)
-docs/      ARCHITECTURE.md, SETUP.md
-scripts/   install.sh, uninstall.sh
+router/      TypeScript dual-intake proxy (src/, package.json, tsconfig.json)
+cli/         upb — Python route-control CLI
+config/      Example config (routes.yaml, secrets.env, systemd service)
+docs/        ARCHITECTURE.md, SETUP.md
+scripts/     install.sh, uninstall.sh
+WORKLOG.md   Multi-session coordination hub (shared backlog + session log)
 ```
+
+## Contributing / multi-session work
+
+This project is coordinated across sessions via [`WORKLOG.md`](WORKLOG.md) — a
+shared backlog, in-progress/done tracker, and session log. To contribute: read
+`WORKLOG.md` first, check *In progress* (don't duplicate), claim an *Open*
+item, work in small commits, and log it in the session-log table. Ground rules
+(secrets never in the repo, don't break the live system, verify before marking
+Done) are in the WORKLOG header.
 
 ## License
 
