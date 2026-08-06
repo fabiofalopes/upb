@@ -1,155 +1,172 @@
 # upb — Universal Provider Bridge
 
-Route control + translation proxy for LLM providers. Point Claude Code,
-OpenCode, or any OpenAI-compatible client at a single local endpoint and route
-requests to whichever provider and model you choose — with protocol
-translation, streaming, retries, and usage tracking handled for you.
+**upb** makes Claude Code provider-agnostic. It is a dual-intake translation
+proxy (Anthropic Messages API ⇄ OpenAI Chat Completions), a route-control CLI,
+and a single-source-of-truth key manager in one package. You point Claude Code
+at a local proxy exactly once; after that, the upstream provider becomes a
+config choice. Route to Alibaba Token Plan, Z.AI, DeepSeek, LiteLLM, Ollama,
+PrimeIntellect, OpenCode Zen, or any other OpenAI-compatible endpoint — without
+touching your client again.
 
-## The problem
+The practical effect: Claude Code stops being hardwired to Anthropic. You get
+one central provider tool for your whole workflow, and you can move fast —
+swap models, A/B providers, or fall back to a free tier by editing one YAML
+file, not by rewriting your setup.
 
-Coding agents are picky about which API they talk to:
+## Why
 
-- **Claude Code** speaks the Anthropic Messages API and expects `claude-*`
-  model names.
-- **OpenCode / Hermes / other agents** speak the OpenAI Chat Completions API.
+Two problems, one bridge:
 
-Meanwhile, the models you actually want to use live behind a dozen different
-providers, each with its own base URL, auth scheme, and quirks. `upb` collapses
-that mess into one local proxy plus one config file.
+1. **Claude Code only speaks the Anthropic Messages API** and expects
+   `claude-*` model names. It cannot talk to an OpenAI-compatible endpoint
+   directly.
+2. **Every provider is a snowflake** — its own base URL, auth scheme, model
+   ids, and quirks. Wiring each one by hand is a maintenance tax.
 
-## Architecture overview
+upb centralizes the four things that differ per provider — **protocol
+translation, routing, key management, and usage tracking** — behind a single
+local endpoint. The provider stops being a rewrite and becomes a line of config.
+This is deliberately built for experimentation: breaking things in a sandbox
+to see which model actually codes better is a feature, not a risk.
 
-The router is a **dual-intake proxy**:
+## Architecture
 
-| Intake | Endpoint | Speaks | Used by |
-|--------|----------|--------|---------|
-| Anthropic | `POST /v1/messages` | Messages API | Claude Code |
-| OpenAI | `POST /v1/chat/completions` | Chat Completions | OpenCode, Hermes, any OpenAI client |
-
-Requests are routed by **model prefix** (`litellm/some-model` → the `litellm`
-provider) or by a **model map** that translates `claude-*` wire names to the
-real upstream model. Anthropic-format requests are translated to OpenAI format
-on the way out and translated back on the way in, including streaming SSE.
+The router is a **dual-intake proxy**: it accepts both API dialects and routes
+by model prefix or a `claude-*` model map.
 
 ```
-Claude Code ──/v1/messages──────────┐
-                                    ├─▶ [router] ─▶ provider (OpenAI-compatible)
-OpenCode ─────/v1/chat/completions──┘      │
-                                     translate · retry · log usage
+ Claude Code ──POST /v1/messages──────────────┐
+                                              │     ┌─────────────────────────┐
+ OpenCode ────POST /v1/chat/completions───────┼────▶│  upb router  :8705      │──▶ Alibaba Token Plan
+                                              │     │  translate · route ·    │──▶ Z.AI / DeepSeek
+ any agent ───POST /v1/chat/completions───────┘     │  retry · log usage      │──▶ LiteLLM / Ollama / …
+                                                    └─────────────────────────┘
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
+Anthropic-format requests are translated to OpenAI format on the way out and
+back on the way in, including streaming SSE. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design (translation
+layer, streaming pipeline, auth model, retry logic).
 
 ## Quick start
 
-Requirements: **Node.js 22+**, **Python 3.10+** (with `python3-yaml`).
+Requirements: Linux, **Node.js 22+**, **Python 3.10+** with `yaml`. The
+installer can fetch Node and PyYAML best-effort if they are missing.
 
 ```bash
-# 1. Install the CLI and scaffold config
-./scripts/install.sh
+git clone <this-repo> upb && cd upb
 
-# 2. Add your provider keys
-$EDITOR ~/.config/upb/secrets.env
-chmod 600 ~/.config/upb/secrets.env
+./scripts/install.sh --dry-run   # review the full plan, change nothing
+./scripts/install.sh             # build router, install CLI, wire Claude Code
 
-# 3. Build and run the router
-cd router
-npm install
-npm run build
-npm start
+$EDITOR ~/.config/upb/secrets.env   # add your provider keys
+upb sync                            # pull keys -> regenerate router.env
+systemctl --user restart upb-router
 ```
 
-The router listens on port `8443` by default (override with `PORT` /
-`UPB_PORT`). Check it with:
+The installer builds the router, installs the `upb` CLI, scaffolds config,
+generates `router.env`, installs a systemd user service, and points Claude Code
+at the proxy (backing up your existing settings first). Always run `--dry-run`
+first to see exactly what will happen. Full walkthrough:
+[docs/SETUP.md](docs/SETUP.md).
 
-```bash
-curl -s http://localhost:8443/health
-```
+## Install modes
 
-See [docs/SETUP.md](docs/SETUP.md) for step-by-step instructions, including
-running as a systemd service and wiring up Claude Code / OpenCode.
+The installer is idempotent and handles both a fresh box and an existing Claude
+Code install:
 
-## Route management (the `upb` CLI)
+| Mode | What happens |
+|------|--------------|
+| **From scratch** | Builds everything, creates `~/.config/upb/`, creates `~/.claude/settings.json` with just the proxy env block. |
+| **Take over / extend** | Detects an existing `~/.claude/settings.json`, backs it up to `settings.json.upb-backup-<epoch>`, and **merges** the proxy env block — all other settings and env vars are preserved, never clobbered. |
 
-`upb` reads `~/.config/upb/routes.yaml` and manages launching Claude Code (or
-any client) through a chosen provider route.
+Useful flags: `--dry-run` (plan only), `--no-claude` (skip the Claude Code
+takeover), `--no-systemd` (skip the service), `--skip-deps` (don't install
+Node/PyYAML), `--prefix <dir>` (router runtime dir), `--force` (overwrite
+existing config after backing it up). Full reference in
+[docs/SETUP.md](docs/SETUP.md#flag-reference).
+
+## CLI reference
+
+`upb` reads `~/.config/upb/routes.yaml` (override with `$UPB_ROUTES`).
 
 | Command | What it does |
 |---------|--------------|
-| `upb list [--all] [--json]` | Show eligible routes (or everything with `--all`) |
-| `upb models PROVIDER [--refresh]` | List a provider's models (live fetch for `catalog: live`) |
-| `upb status [--json]` | Key resolution + live endpoint health |
+| `upb list [--all] [--json]` | Eligible routes (or everything with `--all`) |
+| `upb status [--json]` | Key resolution + live endpoint health per provider |
 | `upb run ROUTE [-- ARGS...]` | Launch `claude` through a route (`default`, `provider`, or `provider/model`) |
-| `upb stop [ROUTE \| --all]` | Stop proxies spawned by `upb` (never touches systemd's) |
+| `upb stop [ROUTE \| --all]` | Stop proxies spawned by `upb` (never the systemd one) |
 | `upb default` | Show the default route |
-| `upb env` | Print shell-exportable env vars pointing at the persistent router |
-| `upb sync` | Sync keys: pull from source stores → `secrets.env` → push to derived files |
-| `upb doctor` | Check config, keys, ports, binaries, and hygiene |
+| `upb doctor` | Config, keys, ports, binaries, hygiene checks |
+| `upb models PROVIDER [--refresh]` | List a provider's models (live fetch for `catalog: live`) |
+| `upb sync [--full]` | Pull keys → `secrets.env` → generate/update `router.env` |
+| `upb env` | Print shell exports pointing at the persistent router |
+
+Two commands deserve emphasis:
+
+- **`upb sync`** is the key pipeline. It pulls keys from the places they live
+  (OpenCode `auth.json` / `opencode.json`, your environment), writes them to
+  `secrets.env`, and generates `router.env` — the file that drives the router
+  in single-provider mode. **`upb sync --full`** regenerates `router.env` from
+  scratch instead of updating it in place.
+- **`upb env`** prints `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+  `OPENAI_BASE_URL`, and `OPENAI_API_KEY` so any other tool can target the
+  proxy: `eval "$(upb env)"`.
 
 Exit codes: `0` ok · `2` config/usage error · `3` no eligible route · `4` spawn failed.
 
 ## Usage tracking
 
-Every proxied request is appended to a JSONL usage log (`usage.jsonl` in the
-working directory by default, override with `USAGE_LOG`). Each entry records
-timestamp, provider, model, wire model, prompt/completion/total tokens, and
-whether it streamed.
-
-Query a live summary:
+Every proxied request is appended to a JSONL log (`usage.jsonl` in the router's
+working directory; override with `USAGE_LOG`). Each entry records timestamp,
+provider, model, wire model, prompt/completion/total tokens, and whether it
+streamed. Query the live aggregate:
 
 ```bash
-curl -s http://localhost:8443/usage
+curl -s http://127.0.0.1:8705/usage
 ```
 
-Returns totals plus breakdowns by provider and by model.
+Returns totals plus breakdowns by provider and by model — handy when you are
+evaluating which provider earns its keep.
 
 ## Provider support
 
-Providers are declared in `providers.yaml` (router) and `routes.yaml` (CLI).
-All are OpenAI-compatible endpoints unless noted.
+Providers are declared in `~/.config/upb/routes.yaml`. `kind: upb` routes go
+through the translation proxy; `kind: anthropic-native` providers speak the
+Anthropic protocol directly and are passed through without a local proxy.
 
-| Provider | Kind | Notes |
-|----------|------|-------|
-| `alibaba` | upb proxy | Alibaba Token Plan; per-model port routing |
-| `zai` | anthropic-native | Z.AI coding plan (GLM family) |
-| `deepseek` | anthropic-native | Native Anthropic protocol endpoint |
-| `zen` | upb proxy | OpenCode Zen free tier |
-| `litellm` | upb proxy | LiteLLM gateway (multi-model) |
-| `prime-intellect` | upb proxy | Pay-per-use inference, live catalog |
-| `ollama` | upb proxy | Local or cloud Ollama |
+| Provider | Kind | Key required | Notes |
+|----------|------|:---:|-------|
+| `alibaba` | upb | yes | Alibaba Token Plan; per-model port routing |
+| `zai` | anthropic-native | yes | Z.AI coding plan (GLM family) |
+| `deepseek` | anthropic-native | yes | Native Anthropic-protocol endpoint |
+| `litellm` | upb | yes | LiteLLM gateway (multi-model) |
+| `prime-intellect` | upb | yes | Pay-per-use, `catalog: live` (explicit runs only) |
+| `zen` | upb | no | OpenCode Zen free tier |
+| `ollama` | upb | yes | Local or cloud Ollama |
 
-## Configuration reference
+Keys are referenced by env-var name in `routes.yaml` and resolved from
+`secrets.env` at runtime — a raw key never lives in YAML.
 
-| File | Purpose |
-|------|---------|
-| `router/providers.yaml` | Router provider definitions, model maps, defaults |
-| `~/.config/upb/routes.yaml` | CLI routes, per-provider models/ports, Claude env |
-| `~/.config/upb/secrets.env` | Single source of truth for provider keys (`chmod 600`) |
-| `config/universal-router.service.example` | systemd user-service template |
+## Uninstall
 
-Environment variables:
+```bash
+./scripts/uninstall.sh           # stop service, remove CLI + router runtime
+./scripts/uninstall.sh --purge   # also remove ~/.config/upb (keys included)
+```
 
-| Variable | Meaning |
-|----------|---------|
-| `PORT` / `UPB_PORT` | Router listen port (default `8443`) |
-| `USAGE_LOG` | Path to the JSONL usage log |
-| `LOCAL_SECRET` | Shared secret for the Anthropic intake auth |
-| `UPB_ROUTES` | Override path to `routes.yaml` |
-| `UPB_SECRETS` | Override path to `secrets.env` |
-| `UPB_ROUTER_ENV` | Override path to the router env file used by `upb env`/`upb sync` |
-| `UPB_PROVIDER`, `UPB_BASE_URL`, `UPB_API_KEY`, `UPB_MODEL_MAP`, `UPB_TIMEOUT` | Env-var-only router mode (no YAML) |
-
-API keys in `providers.yaml` use `${ENV_VAR:-default}` placeholders so no
-secret ever lives in the file itself.
+Config and keys are **preserved by default**. `~/.claude/settings.json` is
+never removed automatically — the uninstaller prints how to restore it from the
+`.upb-backup` created during install. `--dry-run` is supported.
 
 ## Repository layout
 
 ```
 router/    TypeScript dual-intake proxy (src/, package.json, tsconfig.json)
 cli/       upb — Python route-control CLI
-config/    Example config files (routes, secrets, systemd service)
-docs/      Architecture and setup guides
-scripts/   install.sh
+config/    Example config (routes.yaml, secrets.env, systemd service)
+docs/      ARCHITECTURE.md, SETUP.md
+scripts/   install.sh, uninstall.sh
 ```
 
 ## License

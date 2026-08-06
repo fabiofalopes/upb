@@ -1,171 +1,222 @@
 # Setup guide
 
-Step-by-step instructions to get the router running and your clients talking to it.
+Step-by-step instructions to get the router running and your clients talking to
+it. Two paths are covered: installing **from scratch** on a fresh box, and
+**taking over** a machine where Claude Code is already installed.
 
 ## Prerequisites
 
-- **Node.js 22+** (the router is ESM TypeScript compiled with `tsc`)
-- **Python 3.10+** with `python3-yaml` (for the `upb` CLI)
-- A provider API key for at least one provider you want to use
+- **Linux** with a systemd user session (`systemctl --user` works). Containers
+  without a user session are supported via a manual/nohup fallback.
+- **Node.js 22+** (the router is ESM TypeScript compiled with `tsc`).
+- **Python 3.10+** with `yaml` (for the `upb` CLI). On Debian/Kali:
+  `sudo apt install python3-yaml`.
+- **git**, and a provider API key for at least one provider you want to use.
 
-On Debian/Kali:
+The installer will try to install Node and PyYAML for you best-effort if they
+are missing. Pass `--skip-deps` to bypass that and manage dependencies yourself.
+
+## Install from scratch
+
+Full walkthrough on a fresh box:
 
 ```bash
-sudo apt install python3-yaml
-```
+git clone <this-repo> upb && cd upb
 
-## 1. Install
+# 1. Review the plan first — prints every action, changes nothing.
+./scripts/install.sh --dry-run
 
-From the repository root:
-
-```bash
+# 2. Install for real.
 ./scripts/install.sh
 ```
 
-This copies `cli/upb` to `~/bin/upb`, creates `~/.config/upb/`, and installs
-the example config files if you don't already have them. Make sure `~/bin` is
-on your `PATH`.
-
-## 2. Configure secrets
-
-`secrets.env` is the single source of truth for provider keys. Copy the example
-and fill in your keys:
+The installer then: builds the router into `~/.local/share/upb/router`,
+installs the CLI to `~/bin/upb`, scaffolds `~/.config/upb/`, generates
+`~/.config/upb/router.env`, installs + starts the `upb-router.service` user
+service, and points Claude Code at the proxy.
 
 ```bash
-cp config/secrets.env.example ~/.config/upb/secrets.env
-chmod 600 ~/.config/upb/secrets.env
+# 3. Add your real provider keys.
 $EDITOR ~/.config/upb/secrets.env
+chmod 600 ~/.config/upb/secrets.env
+
+# 4. Re-sync so router.env picks up the real keys.
+upb sync
+systemctl --user restart upb-router
+
+# 5. Verify.
+curl -s http://127.0.0.1:8705/health
 ```
 
-Keys are referenced from `providers.yaml` / `routes.yaml` via environment
-variables — never paste a raw key into a YAML file.
+A healthy response looks like `{"status":"ok","service":"universal-provider-router",...}`.
 
-## 3. Configure routes
+## Take over an existing Claude Code install
 
-Copy the routes example and customize:
+If `~/.claude/settings.json` already exists, the installer **extends** it rather
+than replacing it:
+
+1. **Detection** — Phase 0 reports `claude settings.json: /home/you/.claude/settings.json`.
+2. **Backup** — before touching it, the installer copies it to
+   `~/.claude/settings.json.upb-backup-<epoch>`.
+3. **Merge** — it sets only four keys inside the `env` block
+   (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`,
+   `CLAUDE_CODE_SUBAGENT_MODEL`). Every other top-level key and every other env
+   var is preserved.
+
+To review what changed, diff the backup against the live file:
 
 ```bash
-cp config/routes.yaml.example ~/.config/upb/routes.yaml
-$EDITOR ~/.config/upb/routes.yaml
+diff ~/.claude/settings.json.upb-backup-* ~/.claude/settings.json
 ```
 
-Set `proxy.dir` to where you keep the router (the `router/` directory) and
-`proxy.node` to your Node binary (or just `node` if it's on `PATH`). Define the
-providers, models, and ports you want under `providers:`.
-
-## 4. Build and run the router
+To revert, copy the backup back:
 
 ```bash
-cd router
-npm install
-npm run build
-npm start
+cp ~/.claude/settings.json.upb-backup-<epoch> ~/.claude/settings.json
 ```
 
-Verify:
+`--force` makes the installer overwrite existing config files (`routes.yaml`,
+`secrets.env`) — but it still backs each one up first. Without `--force`,
+existing config files are kept untouched.
+
+## Flag reference
+
+### `scripts/install.sh`
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--dry-run` | off | Print every action, change nothing |
+| `--prefix <dir>` | `~/.local/share/upb` | Router runtime install dir |
+| `--config-dir <dir>` | `~/.config/upb` | Config dir |
+| `--bin-dir <dir>` | `~/bin` | CLI install dir |
+| `--port <n>` | `8705` | Router listen port |
+| `--model <name>` | derived | Default model for the Claude takeover |
+| `--skip-deps` | off | Don't install Node / PyYAML |
+| `--no-systemd` | off | Skip user-service install |
+| `--no-claude` | off | Skip Claude Code takeover |
+| `--force` | off | Overwrite existing config (backs up first) |
+| `-h`, `--help` | — | Show help |
+
+### `scripts/uninstall.sh`
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--dry-run` | off | Print every action, change nothing |
+| `--prefix <dir>` | `~/.local/share/upb` | Router runtime dir to remove |
+| `--config-dir <dir>` | `~/.config/upb` | Config dir (preserved unless `--purge`) |
+| `--bin-dir <dir>` | `~/bin` | CLI dir to remove |
+| `--purge` | off | Also remove the config dir (keys included) |
+| `-h`, `--help` | — | Show help |
+
+## Key management
+
+`~/.config/upb/secrets.env` is the **single source of truth** for provider keys
+(`chmod 600`). `routes.yaml` references keys only by env-var name; a raw key
+never lives in YAML.
+
+`upb sync` is the pipeline that keeps everything consistent:
+
+- **Pull** — reads keys from where they already live:
+  - OpenCode `~/.local/share/opencode/auth.json` (e.g. `ALIBABA_TOKEN_PLAN_KEY`, `OPENCODE_GO_KEY`)
+  - OpenCode `~/.config/opencode/opencode.json` (the LiteLLM `apiKey`)
+  - Your environment (`ZAI_API_KEY`, `PRIME_INTELLECT_API_KEY`, `OLLAMA_API_KEY`, `DEEPSEEK_API_KEY`)
+- **Write** — merges them into `secrets.env` (`chmod 600`).
+- **Push** — generates/updates `~/.config/upb/router.env`, the file that drives
+  the router in single-provider mode (`PORT`, `UPB_PROVIDER`, `UPB_BASE_URL`,
+  `UPB_API_KEY`, `UPB_MODEL_MAP`, `LOCAL_SECRET`).
+
+`upb sync --full` regenerates `router.env` from scratch. Plain `upb sync`
+updates it in place when it already exists.
+
+**`LOCAL_SECRET`** is the shared token that authenticates clients to the proxy.
+`upb sync` preserves it across regenerations if `router.env` already has one,
+otherwise it generates a stable random value (`upb-local-<hex>`). Claude Code
+receives it as `ANTHROPIC_AUTH_TOKEN`.
+
+## Running the router
+
+The installer runs the router as a systemd **user** service named
+`upb-router.service`:
 
 ```bash
-curl -s http://localhost:8443/health
-curl -s http://localhost:8443/v1/models
+systemctl --user status upb-router
+systemctl --user restart upb-router
+journalctl --user -u upb-router -n 40        # logs
 ```
 
-For development with auto-reload-from-source:
+The service loads `router.env` via `EnvironmentFile=`, so the port and provider
+come from there. **`PORT`** is set by `upb sync` (from `routes.yaml`
+`defaults.port`, defaulting to `8705`) and aligned to `install.sh --port`.
+
+**No systemd?** Run it in the foreground or backgrounded:
 
 ```bash
-npm run dev
+cd ~/.local/share/upb/router
+set -a; . ~/.config/upb/router.env; set +a   # load PORT/UPB_* into the env
+node dist/index.js                            # foreground
+# or: nohup node dist/index.js > /tmp/upb-router.log 2>&1 &
 ```
 
-## 5. Run as a systemd user service
+## Claude Code integration details
 
-Copy the service template and edit the paths:
+The installer writes four env vars into `~/.claude/settings.json` under `env`:
 
-```bash
-mkdir -p ~/.config/systemd/user
-cp config/universal-router.service.example ~/.config/systemd/user/universal-router.service
-$EDITOR ~/.config/systemd/user/universal-router.service
-```
+| Var | Value | Why |
+|-----|-------|-----|
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` | Point Claude Code at the local proxy instead of Anthropic |
+| `ANTHROPIC_AUTH_TOKEN` | the `LOCAL_SECRET` | Authenticate to the proxy's Anthropic intake |
+| `ANTHROPIC_MODEL` | default route's model | The upstream model that answers as the "main" model |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | default route's model | Model used by Claude Code subagents |
 
-Set `WorkingDirectory` to your `router/` directory and `EnvironmentFile` to a
-file exporting your keys (e.g. `UPB_API_KEY`, `LOCAL_SECRET`, `PORT`). Then:
+`upb run ROUTE` is the per-invocation alternative: it launches `claude` with the
+right environment for one route without editing `settings.json`
+(`upb run default`, `upb run zai`, `upb run zai/glm-5.2`).
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now universal-router
-systemctl --user status universal-router
-```
-
-The `upb` CLI is aware of this service: `upb doctor` reports its state, and
-`upb stop` will never kill the systemd-managed proxy.
-
-## 6. Claude Code integration
-
-`upb run` launches `claude` with the right environment automatically:
-
-```bash
-upb run default            # highest-priority eligible route
-upb run zai                # a specific provider
-upb run zai/glm-5.2        # a specific provider/model
-```
-
-Under the hood it sets `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` (plus
-any `claude_env` overrides from `routes.yaml`) and execs `claude`.
-
-To point a shell at the persistent router manually:
+**Pointing other tools at the proxy.** `upb env` prints exports for both
+dialects; eval it in a shell, or paste the equivalent into any tool's config:
 
 ```bash
 eval "$(upb env)"
+# sets ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, OPENAI_BASE_URL, OPENAI_API_KEY
 ```
 
-Or set the equivalent block in Claude Code's `settings.json` `env` section:
+For an OpenAI-only client, use `OPENAI_BASE_URL` (the OpenAI intake) and a
+provider-prefixed model name to control routing, e.g. `litellm/some-model`.
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8443",
-    "ANTHROPIC_AUTH_TOKEN": "your-local-secret"
-  }
-}
-```
-
-## 7. OpenCode / OpenAI-client integration
-
-Point any OpenAI-compatible client at the OpenAI intake:
+## Verification & troubleshooting
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8443/v1
-export OPENAI_API_KEY=your-local-secret
+curl -s http://127.0.0.1:8705/health   # expect status: ok
+upb doctor                              # config, keys, ports, binaries, hygiene
+upb list                                # eligible routes
+upb status                              # key resolution + live endpoint health
 ```
 
-Use a model name with a provider prefix to control routing, e.g.
-`litellm/some-model`. `upb env` prints these exports too.
+Common failures:
 
-## 8. Key management with `upb sync`
+- **Port already in use** — pick another with `install.sh --port <n>`, or stop
+  the conflicting process. `upb doctor` reports duplicate ports.
+- **`node` too old** — the installer needs Node >= 22; install it manually and
+  re-run with `--skip-deps`.
+- **Missing keys** — `router.env` gets an empty/placeholder `UPB_API_KEY` and
+  `upb sync` warns. Add the key to `secrets.env`, then `upb sync` again.
+- **Service won't start** — `journalctl --user -u upb-router -n 40`. Usually a
+  bad `router.env` (missing key) or a missing `dist/index.js` (re-run install).
+- **401 from the router** — the client's token doesn't match `LOCAL_SECRET`.
+- **`upb: python3-yaml is required`** — `sudo apt install python3-yaml`.
 
-`upb sync` keeps `secrets.env` in sync with the places your keys actually live:
+Note: `upb doctor`'s systemd-awareness line refers, for historical reasons, to a
+service named `universal-router`. The installer creates `upb-router.service`, so
+use `systemctl --user status upb-router` directly to check the installed service.
+
+## Uninstall
 
 ```bash
-upb sync
+./scripts/uninstall.sh           # stop service, remove CLI + router runtime
+./scripts/uninstall.sh --purge   # also remove ~/.config/upb (keys included)
 ```
 
-It pulls keys from known source stores (e.g. OpenCode's `auth.json` /
-`opencode.json` and the environment), writes them to `secrets.env` (`chmod 600`),
-and pushes derived files (such as the router env file referenced by
-`UPB_ROUTER_ENV`) so the running service picks up rotated keys.
-
-## 9. Verify everything
-
-```bash
-upb doctor     # config, keys, ports, binaries, hygiene
-upb status     # key resolution + live endpoint health
-upb list       # eligible routes
-```
-
-## Troubleshooting
-
-- **`upb: python3-yaml is required`** — install `python3-yaml`.
-- **Router won't start** — run `npm run build` first; `npm start` runs the
-  compiled `dist/index.js`.
-- **401 from the router** — your client's API key doesn't match `LOCAL_SECRET`.
-- **Wrong model reached** — check the provider prefix and the provider's
-  `model_map` in `providers.yaml`.
-- **Where did my tokens go?** — `curl -s http://localhost:8443/usage`.
+By default your config and keys (`routes.yaml`, `secrets.env`, `router.env`) are
+**preserved**. `~/.claude/settings.json` is never removed automatically — the
+uninstaller prints the `cp` command to restore it from the `.upb-backup`. Use
+`--dry-run` to preview.
