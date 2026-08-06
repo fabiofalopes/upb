@@ -1,0 +1,22 @@
+{
+  "name": "universal-provider-router",
+  "version": "0.2.0",
+  "description": "Universal Provider Router — multi-provider streaming proxy for Claude Code, OpenCode, Hermes, and any OpenAI-compatible agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "proxy:status": "curl -s http://localhost:${PORT:-8443}/health",
+    "proxy:models": "curl -s http://localhost:${PORT:-8443}/v1/models"
+  },
+  "dependencies": {
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

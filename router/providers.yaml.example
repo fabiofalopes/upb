@@ -1,0 +1,106 @@
+# ── Universal Provider Router — Provider Configuration ──
+# Each provider is an OpenAI-compatible endpoint.
+# Model prefix routing: when OpenCode/Hermes send a model name
+# like "litellm/qwopus3.5-9b-coder", it routes to the "litellm" provider.
+#
+# Claude Code sends "claude-*" wire names → model_map translates them.
+
+version: "1"
+
+defaults:
+  timeout: 300000       # 5 min default
+  retries: 3
+  strip_betas: true
+  thinking_mode: passthrough
+  local_secret: claude-universal-local
+  # Port is controlled by UPB_PORT / PORT env vars (set by claude-ollama-* scripts)
+
+providers:
+  # ── 1. LiteLLM Gateway — University of Lusofona ──
+  # 6 models, 128K context, tool-call capable
+  # Quota: 5h session, independent from RPi
+  litellm:
+    type: openai_compatible
+    base_url: https://modelos.ai.ulusofona.pt/v1
+    # Canonical key lives in ~/.config/opencode/opencode.json
+    # (provider.litellm.options.apiKey). Plaintext default removed 2026-08-05.
+    # For yaml-mode launches: export LITELLM_API_KEY (upb does this automatically).
+    api_key: "${LITELLM_API_KEY:-}"
+    timeout: 300000
+    strip_thinking: false
+    strip_cache_control: false
+    model_prefix: litellm
+    icon: 🎓
+    model_map:
+      claude-opus-4-6: litellm/qwopus3.5-9b-coder
+      claude-sonnet-4-6: litellm/qwable-9b-claude-fable-5
+      claude-haiku-4-5: litellm/amalia-9b
+
+  # ── 2. OpenCode Zen Free Tier ──
+  # Free tier — deepseek-v4-flash-free, north-mini-code-free
+  zen:
+    type: openai_compatible
+    base_url: https://opencode.ai/zen/v1
+    api_key: ""
+    timeout: 300000
+    strip_thinking: false
+    strip_cache_control: false
+    model_prefix: zen
+    icon: 🆓
+    model_map:
+      claude-opus-4-6: zen/big-pickle
+      claude-sonnet-4-6: zen/deepseek-v4-flash-free
+      claude-haiku-4-5: zen/north-mini-code-free
+
+  # ── 3. OpenCode Go Provider ──
+  # GLM-5.x, DeepSeek V4 Pro/Flash, MiniMax M3
+  # Requires opencode-go binary or gateway
+  opencode-go:
+    type: openai_compatible
+    base_url: https://api.opencode.ai/v1
+    api_key: "${OPENCODE_GO_API_KEY:-}"
+    timeout: 300000
+    strip_thinking: false
+    strip_cache_control: false
+    model_prefix: opencode-go
+    icon: ⚡
+    model_map:
+      claude-opus-4-6: opencode-go/glm-5.2
+      claude-sonnet-4-6: opencode-go/deepseek-v4-pro
+      claude-haiku-4-5: opencode-go/deepseek-v4-flash
+
+  # ── 4. Z.AI Coding Plan ──
+  # GLM-5.x, GLM-4.5-air, DeepSeek, Qwen
+  # Paid plan — coding plan gas / token plan
+  zai:
+    type: openai_compatible
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key: "${ZAI_API_KEY:-}"
+    timeout: 300000
+    strip_thinking: false
+    strip_cache_control: false
+    model_prefix: zai
+    icon: 🧠
+    model_map:
+      claude-opus-4-6: zai/glm-5.2
+      claude-sonnet-4-6: zai/glm-5.1
+      claude-haiku-4-5: zai/glm-4.5-air
+
+  # ── 5. Ollama Cloud ──
+  # Local or cloud Ollama — qwen, deepseek, llama
+  ollama:
+    type: openai_compatible
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    timeout: 600000      # local models are slower
+    strip_thinking: true
+    strip_cache_control: true
+    model_prefix: ollama
+    icon: 🦙
+    model_map:
+      claude-opus-4-6: ollama/qwen2.5-coder:32b
+      claude-sonnet-4-6: ollama/qwen2.5-coder:14b
+      claude-haiku-4-5: ollama/llama3.2:3b
+
+# Default provider when no model prefix matches
+active_provider: litellm

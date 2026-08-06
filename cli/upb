@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+# upb — route control for Claude Code over the Universal Provider Bridge.
+#
+# Single source of truth: ~/.config/upb/routes.yaml (override: $UPB_ROUTES).
+# Replaces the claude-* launcher graveyard. Secrets are referenced, never
+# stored here or printed.
+#
+# Usage:
+#   upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
+#   upb models PROVIDER [--refresh] [--json]
+#                                   models of a provider (live fetch for catalog: live)
+#   upb status [--json]             key resolution + live endpoint health
+#   upb run ROUTE [-- ARGS...]      launch claude through a route
+#                                   ROUTE = default | provider | provider/model
+#   upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
+#   upb default                     show the default route
+#   upb doctor                      config, keys, ports, binaries, hygiene
+#
+# Providers with `catalog: live` discover models from /v1/models at runtime;
+# any listed model can be run on demand (upb run provider/<model-id>). They
+# are never the default route — usage-metered surfaces stay an explicit choice.
+#
+# Exit codes: 0 ok · 2 config/usage error · 3 no eligible route · 4 spawn failed
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("upb: python3-yaml is required (apt install python3-yaml)")
+
+CONFIG_PATH = Path(os.environ.get("UPB_ROUTES", "~/.config/upb/routes.yaml")).expanduser()
+CACHE_DIR = Path(os.environ.get("UPB_CACHE", "~/.cache/upb")).expanduser()
+SECRETS_PATH = Path(os.environ.get("UPB_SECRETS", "~/.config/upb/secrets.env")).expanduser()
+ROUTER_ENV_PATH = Path(os.environ.get("UPB_ROUTER_ENV", "~/.config/upb/router.env")).expanduser()
+PORT_RANGE = (9000, 9200)          # dynamic ports for live-catalog routes
+CATALOG_TTL_S = 3600
+
+
+def _load_secrets():
+    """Load secrets.env into os.environ (never overrides already-set vars)."""
+    if not SECRETS_PATH.exists():
+        return
+    for line in SECRETS_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip("'\"")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
+_load_secrets()
+
+# Model names Claude Code sends on the wire — the proxy maps each to the route's model.
+WIRE_NAMES = [
+    "claude-opus-4-8", "claude-opus-4-6",
+    "claude-sonnet-4-8", "claude-sonnet-4-6",
+    "claude-haiku-4-5", "claude-haiku-4-5-20251001",
+    "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
+]
+
+
+def die(msg, code=2):
+    print(f"upb: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_cfg():
+    if not CONFIG_PATH.exists():
+        die(f"config not found: {CONFIG_PATH}")
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    except yaml.YAMLError as e:
+        die(f"config parse error: {e}")
+    if not isinstance(cfg, dict) or "providers" not in cfg:
+        die("config must be a mapping with a 'providers' key")
+    return cfg
+
+
+def parse_date(v):
+    if v is None:
+        return None
+    if isinstance(v, (date, datetime)):
+        return v.date() if isinstance(v, datetime) else v
+    try:
+        return date.fromisoformat(str(v).strip())
+    except ValueError:
+        return None
+
+
+def short_path(p):
+    return str(p).replace(str(Path.home()), "~")
+
+
+def resolve_key(spec):
+    """Return (value_or_None, human_description). Never print the value."""
+    if spec is None or spec == "none":
+        return "", "no key required"
+    if not isinstance(spec, dict):
+        return None, f"bad key spec: {spec!r}"
+    kind = spec.get("type")
+    try:
+        if kind == "env":
+            var = spec["var"]
+            v = os.environ.get(var)
+            return (v or None), f"env:{var}"
+        path = Path(spec.get("path", "")).expanduser()
+        if kind == "json":
+            data = json.loads(path.read_text())
+            for part in str(spec.get("at", "")).split("."):
+                data = data[part]
+            v = str(data).strip()
+            return (v or None), f"json:{short_path(path)}:{spec.get('at')}"
+        if kind == "envfile":
+            var = spec["var"]
+            for line in path.read_text().splitlines():
+                if line.startswith(f"{var}="):
+                    v = line.split("=", 1)[1].strip().strip('"\'')
+                    return (v or None), f"envfile:{short_path(path)}:{var}"
+            return None, f"envfile:{short_path(path)}:{var} (var not found)"
+        if kind == "file":
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if line.startswith("PASTE_") or "YOUR_" in line.upper():
+                        return None, f"file:{short_path(path)} (placeholder)"
+                    return line, f"file:{short_path(path)}"
+            return None, f"file:{short_path(path)} (empty)"
+        return None, f"unknown key type: {kind}"
+    except FileNotFoundError:
+        return None, f"{kind}:{short_path(path)} (file missing)"
+    except Exception as e:
+        return None, f"{kind} lookup failed: {type(e).__name__}"
+
+
+def is_catalog(prov):
+    return prov.get("catalog") == "live"
+
+
+def sorted_providers(cfg):
+    return sorted(cfg["providers"].items(),
+                  key=lambda kv: (kv[1].get("priority", 50), kv[0]))
+
+
+def provider_issues(prov):
+    """Config-level eligibility reasons (no live probing here)."""
+    issues = []
+    if not prov.get("enabled", True):
+        issues.append("disabled")
+    until = parse_date(prov.get("active_until"))
+    if until and date.today() > until:
+        issues.append(f"expired {until.isoformat()}")
+    key, desc = resolve_key(prov.get("key"))
+    if key is None:
+        issues.append(f"no key — {desc}")
+    return issues
+
+
+def iter_routes(cfg):
+    """Yield static route dicts in preference order. Live-catalog providers
+    have no static models and are handled separately."""
+    first_eligible_marked = False
+    for pname, prov in sorted_providers(cfg):
+        if is_catalog(prov):
+            continue
+        issues = provider_issues(prov)
+        for model, mcfg in (prov.get("models") or {}).items():
+            mcfg = mcfg or {}
+            eligible = not issues
+            route = {
+                "provider": pname,
+                "label": prov.get("label", pname),
+                "model": model,
+                "port": mcfg.get("port"),
+                "kind": prov.get("kind", "upb"),
+                "trust_zone": prov.get("trust_zone", "unknown"),
+                "eligible": eligible,
+                "issues": issues,
+                "note": prov.get("note", ""),
+                "active_until": str(prov.get("active_until", "")),
+                "is_default": False,
+                "dynamic": False,
+            }
+            if eligible and not first_eligible_marked:
+                route["is_default"] = True
+                first_eligible_marked = True
+            yield route
+
+
+def fmt_route_name(r):
+    return f"{r['provider']}/{r['model']}"
+
+
+def cached_catalog(pname):
+    f = CACHE_DIR / f"catalog-{pname}.json"
+    try:
+        d = json.loads(f.read_text())
+        if time.time() - d.get("fetched_at", 0) < CATALOG_TTL_S and d.get("models"):
+            return d["models"]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def get_catalog(pname, prov, refresh=False):
+    if not refresh:
+        hit = cached_catalog(pname)
+        if hit:
+            return hit
+    key, desc = resolve_key(prov.get("key"))
+    if key is None:
+        die(f"key unavailable for {pname}: {desc}", 3)
+    url = prov["base_url"].rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={"User-Agent": "upb/1.0"})
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        die(f"catalog fetch failed for {pname}: {e}", 3)
+    models = [m.get("id") for m in data.get("data", []) if m.get("id")]
+    if not models:
+        die(f"catalog empty for {pname}", 3)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / f"catalog-{pname}.json").write_text(
+        json.dumps({"fetched_at": time.time(), "models": models}))
+    return models
+
+
+def resolve_route_arg(cfg, arg):
+    """arg = 'default' | 'provider' | 'provider/model'. Returns route dict or None."""
+    routes = list(iter_routes(cfg))
+    if arg in (None, "", "default"):
+        return next((r for r in routes if r["eligible"]), None)
+    pname, _, model = arg.partition("/")
+    prov = cfg["providers"].get(pname)
+    # live-catalog provider: any model from the (cached) catalog is runnable
+    if prov and is_catalog(prov) and model:
+        issues = provider_issues(prov)
+        route = {
+            "provider": pname, "label": prov.get("label", pname), "model": model,
+            "port": None, "kind": prov.get("kind", "upb"),
+            "trust_zone": prov.get("trust_zone", "unknown"),
+            "eligible": not issues, "issues": issues,
+            "note": prov.get("note", ""),
+            "active_until": str(prov.get("active_until", "")),
+            "is_default": False, "dynamic": True,
+        }
+        if issues:
+            return route
+        if model in get_catalog(pname, prov):
+            return route
+        return None
+    # static routes
+    if model:
+        match = [r for r in routes if r["provider"] == pname and r["model"] == model]
+        return match[0] if match else None
+    match = [r for r in routes if r["provider"] == arg and r["eligible"]]
+    return match[0] if match else None
+
+
+def http_probe(url, key=None, timeout=4.0):
+    """GET probe. Returns (state, detail)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "upb-status/1.0"})
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ms = int((time.time() - t0) * 1000)
+            return "healthy", f"HTTP {resp.status}, {ms} ms"
+    except urllib.error.HTTPError as e:
+        ms = int((time.time() - t0) * 1000)
+        if e.code in (401, 403):
+            return "auth_failed", f"HTTP {e.code}, {ms} ms"
+        if e.code == 404:
+            return "reachable", f"HTTP 404 (no such endpoint), {ms} ms"
+        return "degraded", f"HTTP {e.code}, {ms} ms"
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        return "unreachable", str(reason)
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+
+
+def proxy_health(port, timeout=2.0):
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/health", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def port_busy(port):
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
+
+
+def load_port_state():
+    try:
+        return json.loads((CACHE_DIR / "ports.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_port_state(state):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / "ports.json").write_text(json.dumps(state, indent=1))
+
+
+def ensure_catalog_port(pname, model):
+    """Stable port for a live-catalog route: remembered, else first free in range."""
+    state = load_port_state()
+    rkey = f"{pname}/{model}"
+    port = state.get(rkey)
+    if port:
+        if proxy_health(port) or not port_busy(port):
+            return port            # our proxy still there, or port freed → reuse number
+        # recorded port was taken by something else → allocate a new one below
+    for cand in range(*PORT_RANGE):
+        if cand in state.values() or port_busy(cand):
+            continue
+        state[rkey] = cand
+        save_port_state(state)
+        return cand
+    die("no free port in dynamic range", 4)
+
+
+def node_binary(cfg):
+    want = (cfg.get("proxy") or {}).get("node", "node")
+    want = str(Path(want).expanduser()) if want.startswith("~") else want
+    if os.path.exists(want):
+        return want
+    found = shutil.which("node")
+    if found:
+        return found
+    die(f"node binary not found (wanted: {want})")
+
+
+def ensure_proxy(cfg, prov, model, port, key_value):
+    """Ensure a UPB proxy serves `model` on `port`. Returns True when ready."""
+    if proxy_health(port):
+        print(f"[upb] proxy already healthy on :{port}", file=sys.stderr)
+        return True
+    pdir = Path((cfg.get("proxy") or {}).get("dir", "")).expanduser()
+    entry = pdir / (cfg.get("proxy") or {}).get("entry", "dist/index.js")
+    if not entry.exists():
+        die(f"proxy entry missing: {entry}", 4)
+    pid_dir = Path((cfg.get("proxy") or {}).get("pid_dir", "/tmp"))
+    log_file = pid_dir / f"upb-proxy-{port}.log"
+    pid_file = pid_dir / f"upb-proxy-{port}.pid"
+    env = os.environ.copy()
+    env["UPB_PROVIDER"] = prov.get("upb_provider", "upb")
+    env["UPB_BASE_URL"] = prov["base_url"]
+    env["UPB_API_KEY"] = key_value or ""
+    env["UPB_MODEL_MAP"] = json.dumps({w: model for w in WIRE_NAMES})
+    env["PORT"] = str(port)
+    env["LOCAL_SECRET"] = prov.get("local_secret", "upb-local")
+    print(f"[upb] starting proxy on :{port} ({model})...", file=sys.stderr)
+    with open(log_file, "w") as log:
+        proc = subprocess.Popen([node_binary(cfg), str(entry)],
+                                env=env, stdout=log, stderr=subprocess.STDOUT)
+    pid_file.write_text(str(proc.pid))
+    deadline = time.time() + float((cfg.get("proxy") or {}).get("ready_timeout_s", 15))
+    while time.time() < deadline:
+        time.sleep(0.5)
+        if proxy_health(port):
+            print(f"[upb] proxy ready on :{port}", file=sys.stderr)
+            return True
+    print(f"[upb] proxy failed to start — log: {log_file}", file=sys.stderr)
+    try:
+        sys.stderr.write(log_file.read_text()[-2000:])
+    except OSError:
+        pass
+    return False
+
+
+def claude_binary():
+    found = shutil.which("claude")
+    if not found:
+        die("claude binary not found on PATH")
+    return found
+
+
+def build_launch_env(cfg, prov, route, token, base_url):
+    env = os.environ.copy()
+    env.update((cfg.get("defaults") or {}).get("claude_env") or {})
+    env.update(prov.get("claude_env") or {})
+    env["ANTHROPIC_BASE_URL"] = base_url
+    env["ANTHROPIC_AUTH_TOKEN"] = token
+    return env
+
+
+def print_route_block(route, prov, endpoint_desc, key_desc):
+    print()
+    print("upb route selected")
+    print()
+    print(f"  Provider:  {route['provider']}  ({route['label']})")
+    print(f"  Model:     {route['model']}")
+    print(f"  Endpoint:  {endpoint_desc}")
+    print(f"  Zone:      {route['trust_zone']}")
+    print(f"  Key:       {key_desc}")
+    if route["active_until"]:
+        print(f"  Active:    until {route['active_until']}")
+    print()
+
+
+# ── commands ──────────────────────────────────────────────────────────
+
+def cmd_list(cfg, args):
+    routes = list(iter_routes(cfg))
+    cat_rows = [(pname, prov, provider_issues(prov))
+                for pname, prov in sorted_providers(cfg) if is_catalog(prov)]
+
+    if args.json:
+        out = {"routes": routes,
+               "catalog_providers": [
+                   {"provider": p, "label": prov.get("label", p),
+                    "eligible": not issues, "issues": issues,
+                    "cached_models": len(cached_catalog(p) or [])}
+                   for p, prov, issues in cat_rows]}
+        print(json.dumps(out, indent=2))
+        return 0
+
+    visible = routes if args.all else [r for r in routes if r["eligible"]]
+    cat_visible = cat_rows if args.all else [c for c in cat_rows if not c[2]]
+    if not visible and not cat_visible:
+        print("No eligible routes. Try: upb list --all · upb doctor")
+        return 3
+
+    names = [fmt_route_name(r) for r in visible] + [p for p, _, _ in cat_visible]
+    w = max(len(n) for n in names) if names else 5
+    print(f"{'ROUTE':<{w}}  {'PORT':<5} {'ZONE':<16} STATUS")
+    noted = set()
+    for r in visible:
+        name = fmt_route_name(r)
+        port = str(r["port"]) if r["port"] else "-"
+        if r["eligible"]:
+            status = "ok" + (" · default" if r["is_default"] else "")
+        else:
+            status = "; ".join(r["issues"])
+        if args.all and r["note"] and r["provider"] not in noted:
+            status += f"  [{r['note']}]"
+            noted.add(r["provider"])
+        print(f"{name:<{w}}  {port:<5} {r['trust_zone']:<16} {status}")
+    for pname, prov, issues in cat_visible:
+        cached = cached_catalog(pname)
+        n = f", {len(cached)} models cached" if cached else ""
+        if issues:
+            print(f"{pname:<{w}}  {'-':<5} {prov.get('trust_zone','unknown'):<16} "
+                  f"{'; '.join(issues)}")
+        else:
+            print(f"{pname:<{w}}  {'-':<5} {prov.get('trust_zone','unknown'):<16} "
+                  f"ok · live catalog{n}")
+            print(f"{'':<{w}}                    "
+                  f"run: upb run {pname}/<model-id> · browse: upb models {pname}")
+    if not args.all:
+        hidden = (len(routes) - len(visible)) + (len(cat_rows) - len(cat_visible))
+        if hidden:
+            print(f"\n({hidden} more configured but hidden — upb list --all)")
+    return 0
+
+
+def cmd_models(cfg, args):
+    prov = cfg["providers"].get(args.provider)
+    if not prov:
+        die(f"unknown provider '{args.provider}'", 3)
+    if not is_catalog(prov):
+        models = list((prov.get("models") or {}).keys())
+        if args.json:
+            print(json.dumps({"provider": args.provider, "count": len(models),
+                              "models": models}, indent=2))
+        else:
+            print(f"{args.provider}: {len(models)} configured models")
+            for m in models:
+                print(f"  {m}")
+        return 0
+    models = get_catalog(args.provider, prov, refresh=args.refresh)
+    if args.json:
+        print(json.dumps({"provider": args.provider, "count": len(models),
+                          "models": models}, indent=2))
+        return 0
+    print(f"{args.provider}: {len(models)} models (live catalog)")
+    for m in models:
+        print(f"  {m}")
+    print(f"\nrun one: upb run {args.provider}/<model-id>")
+    return 0
+
+
+def cmd_default(cfg, args):
+    r = resolve_route_arg(cfg, "default")
+    if not r:
+        die("no eligible default route — upb list --all · upb doctor", 3)
+    print(fmt_route_name(r))
+    return 0
+
+
+def cmd_status(cfg, args):
+    provs = {p: prov for p, prov in sorted_providers(cfg)}
+
+    def probe(pname):
+        prov = provs[pname]
+        key, desc = resolve_key(prov.get("key"))
+        url = prov["base_url"].rstrip("/") + "/models"
+        if prov.get("kind") == "anthropic-native":
+            url = prov["base_url"]
+        state, detail = http_probe(url, key or None)
+        return pname, key is not None, desc, state, detail
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for pname, key_ok, desc, state, detail in ex.map(probe, list(provs)):
+            results[pname] = (key_ok, desc, state, detail)
+
+    if args.json:
+        out = [{"provider": p, "key": results[p][1], "key_source": results[p][0],
+                "health": results[p][2], "detail": results[p][3],
+                "enabled": provs[p].get("enabled", True),
+                "catalog": is_catalog(provs[p])} for p in results]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    w = max(len(p) for p in results)
+    print(f"{'PROVIDER':<{w}}  {'KEY':<8} HEALTH")
+    for pname, (key_ok, desc, state, detail) in results.items():
+        flags = []
+        if not provs[pname].get("enabled", True):
+            flags.append("disabled")
+        until = parse_date(provs[pname].get("active_until"))
+        if until and date.today() > until:
+            flags.append(f"expired {until.isoformat()}")
+        if is_catalog(provs[pname]):
+            n = len(cached_catalog(pname) or [])
+            flags.append(f"live catalog{f', {n} cached' if n else ''}")
+        suffix = f"  ({', '.join(flags)})" if flags else ""
+        key_col = "ok" if key_ok else "MISSING"
+        print(f"{pname:<{w}}  {key_col:<8} {state:<11} {detail}{suffix}")
+    dflt = next((r for r in iter_routes(cfg) if r["is_default"]), None)
+    print(f"\ndefault route: {fmt_route_name(dflt) if dflt else 'NONE'}")
+    return 0
+
+
+def cmd_run(cfg, args):
+    route = resolve_route_arg(cfg, args.route)
+    if route is None:
+        pname, _, model = args.route.partition("/")
+        prov = cfg["providers"].get(pname)
+        if prov and is_catalog(prov) and model:
+            die(f"model '{model}' not in {pname} catalog — browse: upb models {pname}", 3)
+        all_r = [r for r in iter_routes(cfg)
+                 if fmt_route_name(r) == args.route or r["provider"] == args.route]
+        if all_r:
+            r = all_r[0]
+            die(f"route '{args.route}' not usable: {'; '.join(r['issues'])}", 3)
+        die(f"unknown route '{args.route}' — see: upb list --all", 3)
+    if not route["eligible"]:
+        die(f"route '{fmt_route_name(route)}' not usable: {'; '.join(route['issues'])}", 3)
+
+    prov = cfg["providers"][route["provider"]]
+    key_value, key_desc = resolve_key(prov.get("key"))
+
+    if route["kind"] == "upb":
+        if key_value is None and prov.get("key") not in (None, "none"):
+            die(f"key unavailable: {key_desc}", 3)
+        port = route["port"]
+        if route.get("dynamic"):
+            port = ensure_catalog_port(route["provider"], route["model"])
+        if not ensure_proxy(cfg, prov, route["model"], port, key_value):
+            die("proxy failed to start", 4)
+        base_url = f"http://localhost:{port}"
+        token = prov.get("local_secret", "upb-local")
+        endpoint_desc = f"{prov['base_url']}  (via UPB proxy :{port})"
+    else:  # anthropic-native
+        if key_value is None:
+            die(f"key unavailable: {key_desc}", 3)
+        base_url = prov["base_url"]
+        token = key_value
+        endpoint_desc = f"{base_url}  (direct, no proxy)"
+
+    print_route_block(route, prov, endpoint_desc, key_desc)
+    env = build_launch_env(cfg, prov, route, token, base_url)
+    binary = claude_binary()
+    print(f"Launching claude ({route['model']})...", file=sys.stderr)
+    os.execve(binary, ["claude"] + args.claude_args, env)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def stop_port(pid_dir, port, label):
+    """Kill our own proxy on `port` if we spawned it. Returns message."""
+    pid_file = pid_dir / f"upb-proxy-{port}.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+        except ValueError:
+            pid = None
+        if pid and pid_alive(pid):
+            os.kill(pid, 15)
+            pid_file.unlink(missing_ok=True)
+            return f"[upb] stopped :{port} (pid {pid}) — {label}"
+        pid_file.unlink(missing_ok=True)
+        return f"[upb] :{port} had stale pidfile — cleaned ({label})"
+    if proxy_health(port):
+        return (f"[upb] :{port} is running but not upb-managed "
+                f"(systemd/manual?) — leaving it alone")
+    return None
+
+
+def cmd_stop(cfg, args):
+    if not args.all and not args.route:
+        die("usage: upb stop --all | upb stop provider/model")
+    pid_dir = Path((cfg.get("proxy") or {}).get("pid_dir", "/tmp"))
+    targets = []    # (port, label)
+    if args.all:
+        for r in iter_routes(cfg):
+            if r["kind"] == "upb" and r["port"]:
+                targets.append((r["port"], fmt_route_name(r)))
+        for rkey, port in load_port_state().items():
+            targets.append((port, f"{rkey} (dynamic)"))
+    else:
+        r = resolve_route_arg(cfg, args.route)
+        if r and r.get("port"):
+            targets = [(r["port"], fmt_route_name(r))]
+        else:
+            port = load_port_state().get(args.route)
+            if port:
+                targets = [(port, f"{args.route} (dynamic)")]
+            else:
+                die(f"nothing stoppable for '{args.route}'", 3)
+    stopped = 0
+    seen = set()
+    for port, label in targets:
+        if port in seen:
+            continue
+        seen.add(port)
+        msg = stop_port(pid_dir, port, label)
+        if msg:
+            print(msg)
+            if msg.startswith("[upb] stopped"):
+                stopped += 1
+    if stopped == 0 and args.all:
+        print("[upb] nothing upb-managed to stop")
+    return 0
+
+
+def cmd_doctor(cfg, args):
+    ok = True
+    def check(label, good, detail=""):
+        nonlocal ok
+        mark = "✓" if good else "✗"
+        if not good:
+            ok = False
+        print(f" {mark} {label}" + (f" — {detail}" if detail else ""))
+
+    print("config")
+    check(f"loads: {short_path(CONFIG_PATH)}", True)
+    perms = oct(CONFIG_PATH.stat().st_mode & 0o777)
+    check("permissions 600", perms == "0o600", f"currently {perms}")
+
+    print("keys")
+    for pname, prov in sorted_providers(cfg):
+        key, desc = resolve_key(prov.get("key"))
+        check(f"{pname}: {desc}", key is not None if prov.get("key") not in (None, "none") else True)
+
+    print("ports")
+    seen = {}
+    dupes = []
+    for pname, prov in cfg["providers"].items():
+        for model, mcfg in (prov.get("models") or {}).items():
+            port = (mcfg or {}).get("port")
+            if port is None:
+                continue
+            if port in seen:
+                dupes.append(f"{port}: {seen[port]} vs {pname}/{model}")
+            seen[port] = f"{pname}/{model}"
+    check("no duplicate ports", not dupes, "; ".join(dupes))
+    dyn = load_port_state()
+    if dyn:
+        print(f" • dynamic ports in use: " +
+              ", ".join(f"{k}→{v}" for k, v in dyn.items()))
+
+    print("binaries & proxy")
+    nb = (cfg.get("proxy") or {}).get("node", "node")
+    check(f"node: {nb}", os.path.exists(str(Path(nb).expanduser())) or bool(shutil.which("node")))
+    pdir = Path((cfg.get("proxy") or {}).get("dir", "")).expanduser()
+    entry = pdir / (cfg.get("proxy") or {}).get("entry", "dist/index.js")
+    check(f"proxy entry: {short_path(entry)}", entry.exists())
+    check("claude binary", bool(shutil.which("claude")), shutil.which("claude") or "missing")
+
+    print("hygiene")
+    raw = CONFIG_PATH.read_text()
+    import re
+    check("no inline secrets in routes.yaml",
+          not re.search(r"(sk-[A-Za-z0-9_\-]{16,})|(key:\s*['\"]?sk-)", raw))
+    legacy = sorted(p.name for p in Path("~/bin").expanduser().glob("claude-*"))
+    check("legacy claude-* launchers removed", not legacy,
+          f"{len(legacy)} remain: {', '.join(legacy[:6])}{'…' if len(legacy) > 6 else ''}" if legacy else "")
+    # systemd-managed proxy awareness
+    try:
+        active = subprocess.run(["systemctl", "--user", "is-active", "universal-router"],
+                                capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        active = "unknown"
+    print(f" • universal-router.service (systemd): {active}"
+          + (" — upb reuses :8705 and will never stop it" if active == "active" else ""))
+    return 0 if ok else 2
+
+
+# ── env ──────────────────────────────────────────────────────────────
+
+def cmd_env(cfg, args):
+    """Print shell-exportable env vars pointing at the persistent router.
+    Usage: eval $(upb env)  |  source <(upb env)"""
+    port = (cfg.get("defaults") or {}).get("port", 8705)
+    # Read LOCAL_SECRET from the systemd env file (source of truth for the service)
+    secret = "claude-universal-local"
+    router_env = ROUTER_ENV_PATH
+    if router_env.exists():
+        for line in router_env.read_text().splitlines():
+            if line.startswith("LOCAL_SECRET="):
+                secret = line.split("=", 1)[1].strip().strip("'\"")
+                break
+    base_url = f"http://127.0.0.1:{port}"
+    print(f"export ANTHROPIC_BASE_URL={base_url}")
+    print(f"export ANTHROPIC_AUTH_TOKEN={secret}")
+    print(f"export OPENAI_BASE_URL={base_url}/v1")
+    print(f"export OPENAI_API_KEY={secret}")
+    return 0
+
+
+# ── sync ─────────────────────────────────────────────────────────────
+
+def cmd_sync(cfg, args):
+    """Sync secrets: pull from source stores → secrets.env → push to derived files."""
+    import re as _re
+
+    secrets = {}
+    if SECRETS_PATH.exists():
+        for line in SECRETS_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                secrets[k.strip()] = v.strip().strip("'\"")
+
+    changed = []
+
+    # ── Pull: opencode auth.json → secrets.env ──
+    auth_path = Path("~/.local/share/opencode/auth.json").expanduser()
+    if auth_path.exists():
+        try:
+            auth = json.loads(auth_path.read_text())
+            pulls = [
+                ("alibaba-token-plan", "ALIBABA_TOKEN_PLAN_KEY"),
+                ("opencode-go", "OPENCODE_GO_KEY"),
+            ]
+            for entry_name, env_name in pulls:
+                if entry_name in auth and auth[entry_name].get("key"):
+                    new_val = auth[entry_name]["key"]
+                    if secrets.get(env_name) != new_val:
+                        secrets[env_name] = new_val
+                        changed.append(f"pulled {env_name} ← auth.json:{entry_name}")
+        except Exception as e:
+            print(f"upb sync: warning: auth.json read failed: {e}", file=sys.stderr)
+
+    # ── Pull: opencode.json litellm key ──
+    oc_path = Path("~/.config/opencode/opencode.json").expanduser()
+    if oc_path.exists():
+        try:
+            oc = json.loads(oc_path.read_text())
+            lk = (oc.get("provider", {}).get("litellm", {}).get("options", {}).get("apiKey", ""))
+            if lk and secrets.get("LITELLM_API_KEY") != lk:
+                secrets["LITELLM_API_KEY"] = lk
+                changed.append("pulled LITELLM_API_KEY ← opencode.json")
+        except Exception:
+            pass
+
+    # ── Pull: env vars that should be persisted ──
+    for var in ("ZAI_API_KEY", "PRIME_INTELLECT_API_KEY", "OLLAMA_API_KEY", "DEEPSEEK_API_KEY"):
+        env_val = os.environ.get(var, "")
+        if env_val and secrets.get(var) != env_val:
+            secrets[var] = env_val
+            changed.append(f"pulled {var} ← environment")
+
+    # ── Write secrets.env ──
+    if changed or not SECRETS_PATH.exists():
+        lines = [
+            "# upb secrets — single source of truth for all provider keys",
+            "# Managed by: upb sync (pulls from auth.json/opencode.json/env)",
+            "# chmod 600 — never commit, never reference from routes.yaml directly",
+            "",
+        ]
+        for k in sorted(secrets):
+            lines.append(f"{k}='{secrets[k]}'")
+        lines.append("")
+        SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SECRETS_PATH.write_text("\n".join(lines))
+        SECRETS_PATH.chmod(0o600)
+        print(f"upb sync: wrote {short_path(SECRETS_PATH)} ({len(secrets)} keys)")
+    else:
+        print(f"upb sync: {short_path(SECRETS_PATH)} already up to date ({len(secrets)} keys)")
+
+    for c in changed:
+        print(f"  • {c}")
+
+    # ── Push: secrets.env → router env file ──
+    router_env = ROUTER_ENV_PATH
+    ali_key = secrets.get("ALIBABA_TOKEN_PLAN_KEY", "")
+    if ali_key and router_env.exists():
+        content = router_env.read_text()
+        new_content = _re.sub(
+            r"^UPB_API_KEY=.*$",
+            f"UPB_API_KEY='{ali_key}'",
+            content, flags=_re.MULTILINE)
+        if new_content != content:
+            router_env.write_text(new_content)
+            router_env.chmod(0o600)
+            print(f"  • pushed ALIBABA_TOKEN_PLAN_KEY → {short_path(router_env)}")
+            # Restart systemd service to pick up new key
+            try:
+                subprocess.run(["systemctl", "--user", "restart", "universal-router.service"],
+                               capture_output=True, timeout=10)
+                print("  • restarted universal-router.service")
+            except Exception as e:
+                print(f"  • warning: service restart failed: {e}", file=sys.stderr)
+        else:
+            print(f"  • {short_path(router_env)} already in sync")
+
+    return 0
+
+
+# ── main ──────────────────────────────────────────────────────────────
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+
+    parser = argparse.ArgumentParser(prog="upb", add_help=False)
+    sub = parser.add_subparsers(dest="cmd")
+    p_list = sub.add_parser("list")
+    p_list.add_argument("--all", action="store_true")
+    p_list.add_argument("--json", action="store_true")
+    p_models = sub.add_parser("models")
+    p_models.add_argument("provider")
+    p_models.add_argument("--refresh", action="store_true")
+    p_models.add_argument("--json", action="store_true")
+    p_status = sub.add_parser("status")
+    p_status.add_argument("--json", action="store_true")
+    p_run = sub.add_parser("run")
+    p_run.add_argument("route")
+    p_run.add_argument("claude_args", nargs=argparse.REMAINDER)
+    p_stop = sub.add_parser("stop")
+    p_stop.add_argument("route", nargs="?")
+    p_stop.add_argument("--all", action="store_true")
+    sub.add_parser("default")
+    sub.add_parser("doctor")
+    sub.add_parser("sync")
+    sub.add_parser("env")
+
+    args = parser.parse_args(argv)
+    cfg = load_cfg()
+    cmd = args.cmd or "list"
+    handlers = {"list": cmd_list, "models": cmd_models, "status": cmd_status,
+                "run": cmd_run, "stop": cmd_stop, "default": cmd_default,
+                "doctor": cmd_doctor, "sync": cmd_sync, "env": cmd_env}
+    # `upb` with no subcommand behaves like `upb list`
+    if args.cmd is None:
+        args.all = False
+        args.json = False
+    if cmd == "run" and args.claude_args and args.claude_args[0] == "--":
+        args.claude_args = args.claude_args[1:]
+    return handlers[cmd](cfg, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

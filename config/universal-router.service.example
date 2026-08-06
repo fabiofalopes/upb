@@ -1,0 +1,15 @@
+[Unit]
+Description=Universal Provider Router (persistent LLM proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/upb/router
+EnvironmentFile=/path/to/upb/config/router.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

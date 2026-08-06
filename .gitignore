@@ -1,0 +1,11 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.log
+usage.jsonl
+secrets.env
+router.env
+*.env
+!*.env.example
+.DS_Store

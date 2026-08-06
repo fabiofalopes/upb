@@ -1,0 +1,204 @@
+# Example routes config — copy to ~/.config/upb/routes.yaml and customize
+version: 1
+defaults:
+  claude_env:
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+    API_TIMEOUT_MS: '600000'
+    CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: '1'
+proxy:
+  dir: ~/upb/router
+  entry: dist/index.js
+  node: node
+  ready_timeout_s: 15
+  pid_dir: /tmp
+providers:
+  alibaba:
+    label: Alibaba Token Plan (Pro)
+    kind: upb
+    upb_provider: alibaba-token-plan
+    base_url: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+    trust_zone: remote-approved
+    key:
+      type: env
+      var: ALIBABA_TOKEN_PLAN_KEY
+    local_secret: claude-alibaba-poser
+    priority: 10
+    enabled: true
+    active_until: '2026-08-20'
+    note: qwen3.8-max-preview also persistent via systemd universal-router.service
+      (:8705)
+    models:
+      qwen3.8-max-preview:
+        port: 8705
+      qwen3.7-max:
+        port: 8704
+      qwen3.7-plus:
+        port: 8703
+      qwen3.6-flash:
+        port: 8702
+      deepseek-v4-pro:
+        port: 8701
+      glm-5.2:
+        port: 8706
+  zai:
+    label: Z.AI Coding Plan (year-long)
+    kind: anthropic-native
+    base_url: https://api.z.ai/api/anthropic
+    trust_zone: remote-approved
+    key:
+      type: env
+      var: ZAI_API_KEY
+    priority: 20
+    enabled: true
+    note: plan models per docs.z.ai (2026-08) — glm-5.2 / glm-5-turbo / glm-4.7
+    models:
+      glm-5.2: {}
+      glm-5-turbo: {}
+      glm-4.7: {}
+    claude_env:
+      ANTHROPIC_MODEL: glm-5.2
+      ANTHROPIC_DEFAULT_OPUS_MODEL: glm-5.2
+      ANTHROPIC_DEFAULT_SONNET_MODEL: glm-5.2
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: glm-5-turbo
+      CLAUDE_CODE_SUBAGENT_MODEL: glm-5-turbo
+  zen:
+    label: OpenCode Zen (free tier)
+    kind: upb
+    upb_provider: zen-free
+    base_url: https://opencode.ai/zen/v1
+    trust_zone: remote-approved
+    key: none
+    local_secret: claude-zen-poser
+    priority: 30
+    enabled: true
+    models:
+      deepseek-v4-flash-free:
+        port: 8801
+      big-pickle:
+        port: 8802
+      north-mini-code-free:
+        port: 8803
+  litellm:
+    label: Lusófona LiteLLM Gateway
+    kind: upb
+    upb_provider: litellm
+    base_url: https://modelos.ai.ulusofona.pt/v1
+    trust_zone: remote-approved
+    key:
+      type: env
+      var: LITELLM_API_KEY
+    local_secret: claude-litellm-poser
+    priority: 40
+    enabled: true
+    models:
+      ornith-9b:
+        port: 8901
+      omnicoder-9b:
+        port: 8903
+  prime-intellect:
+    label: PrimeIntellect Inference (pay-per-use)
+    kind: upb
+    upb_provider: pinference
+    base_url: https://api.pinference.ai/api/v1
+    trust_zone: remote-approved
+    key:
+      type: env
+      var: PRIME_INTELLECT_API_KEY
+    local_secret: upb-pi-poser
+    priority: 50
+    enabled: true
+    catalog: live
+    note: usage-metered, balance unknown — explicit runs only, never the default
+    models: {}
+  pi-own:
+    label: PrimeIntellect own instance (ephemeral)
+    kind: upb
+    upb_provider: pi-own
+    base_url: http://127.0.0.1:8090/v1
+    trust_zone: remote-approved
+    key: none
+    local_secret: upb-piown-poser
+    priority: 55
+    enabled: true
+    note: gpu-deploy managed; alias qwen35-abl; teardown.sh to stop
+    models:
+      qwen35-abl:
+        port: 8931
+  deepseek:
+    label: DeepSeek (native Anthropic protocol)
+    kind: anthropic-native
+    base_url: https://api.deepseek.com/anthropic
+    trust_zone: remote-approved
+    key:
+      type: env
+      var: DEEPSEEK_API_KEY
+    priority: 60
+    enabled: false
+    note: key missing — add DEEPSEEK_API_KEY to ~/.config/upb/secrets.env then re-enable
+    models:
+      deepseek-v4-pro:
+        primary: true
+      deepseek-v4-flash: {}
+    claude_env:
+      API_TIMEOUT_MS: '3000000'
+      ANTHROPIC_MODEL: deepseek-v4-pro[1m]
+      ANTHROPIC_DEFAULT_OPUS_MODEL: deepseek-v4-pro[1m]
+      ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-v4-pro[1m]
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1'
+      CLAUDE_CODE_EFFORT_LEVEL: max
+  ollama-cloud:
+    label: Ollama Cloud
+    kind: upb
+    upb_provider: ollama-local
+    base_url: https://ollama.com/v1
+    trust_zone: remote-approved
+    key:
+      type: envfile
+      path: ~/.hermes/.env
+      var: OLLAMA_API_KEY
+    local_secret: claude-ollama-poser
+    priority: 90
+    enabled: false
+    models:
+      deepseek-v4-pro:
+        port: 8546
+      deepseek-v4-flash:
+        port: 8536
+      deepseek-v3.2:
+        port: 8611
+      gemini-3-flash-preview:
+        port: 8561
+      gemma4:31b:
+        port: 8489
+      glm-5.2:
+        port: 8579
+      glm-5.1:
+        port: 8449
+      glm-5:
+        port: 8502
+      kimi-k2.7-code:
+        port: 8613
+      kimi-k2.6:
+        port: 8592
+      minimax-m3:
+        port: 8498
+      minimax-m2.7:
+        port: 8447
+      qwen3-coder-next:
+        port: 8504
+      qwen3-coder:480b:
+        port: 8642
+      qwen3.5:397b:
+        port: 8525
+      mistral-large-3:675b:
+        port: 8637
+      gpt-oss:120b:
+        port: 8557
+      devstral-2:123b:
+        port: 8599
+      nemotron-3-super:
+        port: 8529
+      nemotron-3-ultra:
+        port: 8477
