@@ -402,16 +402,17 @@ def claude_binary():
     return found
 
 
-def build_launch_env(cfg, prov, route, token, base_url):
+def build_launch_env(cfg, prov, route, token, base_url, explicit_model=False):
     env = os.environ.copy()
     env.update((cfg.get("defaults") or {}).get("claude_env") or {})
     env.update(prov.get("claude_env") or {})
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = token
     # Ensure model identity is set for session binding propagation.
-    # Provider-level claude_env (e.g. zai, deepseek) may already define these;
-    # for UPB proxy routes, default to the route's model name.
-    if "ANTHROPIC_MODEL" not in env:
+    # When a specific model is explicitly requested (upb run provider/model),
+    # it always wins over provider-level claude_env defaults.
+    # When no model is specified (upb run provider), respect claude_env.
+    if explicit_model or "ANTHROPIC_MODEL" not in env:
         env["ANTHROPIC_MODEL"] = route["model"]
     if "CLAUDE_CODE_SUBAGENT_MODEL" not in env:
         env["CLAUDE_CODE_SUBAGENT_MODEL"] = route["model"]
@@ -636,7 +637,8 @@ def cmd_run(cfg, args):
         endpoint_desc = f"{base_url}  (direct, no proxy)"
 
     print_route_block(route, prov, endpoint_desc, key_desc)
-    env = build_launch_env(cfg, prov, route, token, base_url)
+    explicit_model = "/" in args.route
+    env = build_launch_env(cfg, prov, route, token, base_url, explicit_model=explicit_model)
     write_session_binding(env, route)
     binary = claude_binary()
     print(f"Launching claude ({route['model']})...", file=sys.stderr)
