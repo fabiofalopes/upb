@@ -38,6 +38,7 @@ _(none — claim from Open above)_
 - **2026-08-06** — Initial release: monorepo (router + cli + config + docs + scripts). `4969aa5`
 - **2026-08-06** — Self-reproducing installer (`install.sh`/`uninstall.sh`, Claude Code takeover, `upb sync` router.env generation, service-name detection). `d7e07b6`
 - **2026-08-06** — New-model discovery in `upb sync` (`discover: true` + `discover_match`). `4736b3d`
+- **2026-08-07** — Fix: explicit model request (`upb run provider/model`) now overrides provider `claude_env.ANTHROPIC_MODEL`. `6daa1fd`
 
 ---
 
@@ -46,12 +47,13 @@ _(none — claim from Open above)_
 | Date | Session | What was done | Commits |
 |---|---|---|---|
 | 2026-08-06 | orchestrator + fix-2 | Repo creation, installer, docs, service-name fix, model discovery; live key restructure + usage logging + bare-claude routing; litellm/bonsai diagnosis | `4969aa5`, `d7e07b6`, `4736b3d` |
-| 2026-08-07 | orchestrator | Fixed model override bug: `upb run provider/model` now correctly overrides provider-level `claude_env.ANTHROPIC_MODEL` when a specific model is explicitly requested. Previously `zai/glm-4.7` always launched as `glm-5.2`. | _(pending commit)_ |
+| 2026-08-07 | orchestrator | Fixed model override bug: `upb run provider/model` now correctly overrides provider-level `claude_env.ANTHROPIC_MODEL` when a specific model is explicitly requested. Previously `zai/glm-4.7` always launched as `glm-5.2`. | `6daa1fd` |
 
 ---
 
 ## Open questions / findings
 
+- **Model override bug (fixed 2026-08-07)** — Provider-level `claude_env.ANTHROPIC_MODEL` was silently overriding explicitly requested models. `upb run zai/glm-4.7` launched as `glm-5.2`. Root cause: `build_launch_env()` applied provider `claude_env` first, then only set route model if `ANTHROPIC_MODEL` wasn't already present. Fix: `explicit_model` flag forces route model to win when user specifies `provider/model`. Commit `6daa1fd`.
 - **litellm `ornith-9b` serves `bonsai-27b-1bit`** (observed in LiteLLM monitoring, 2026-08-06). Verified NOT an upb bug: upb's :8901 proxy sends `ornith-9b` correctly; a direct gateway call with `model:"ornith-9b"` returns `model:"ornith-9b"`. Conclusion: the Lusófona gateway aliases `ornith-9b` → a deployment named `bonsai-27b-1bit` (server-side `model_list`). Gateway admin info endpoints are blocked for this key (`llm_api_routes` only). **Needs gateway-admin confirmation** whether that aliasing is intentional.
 - **Alibaba token plan has a WEEKLY quota** (seen via 429: "1-week quota exhausted, resets <date>"), in addition to any per-5h window. No API-key usage endpoint exists.
 - **`claude` binary fragility** — an npm reinstall can skip postinstall, leaving `claude.exe` as a stub → `OSError: Exec format error`. Fix: `node ~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/install.cjs`.
