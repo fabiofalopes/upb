@@ -1,0 +1,39 @@
+#!/bin/bash
+# claude — UPB session-binding wrapper.
+#
+# Intercepts all `claude` invocations to inject the correct model routing.
+# If a UPB session binding is active (written by `upb run`), those env vars
+# are used. Otherwise, the default binding (alibaba :8705) applies.
+#
+# This ensures sub-sessions and workflow relaunches stay bound to the model
+# that was originally selected, rather than silently falling back to the
+# default route.
+#
+# Managed by: upb (Universal Provider Bridge)
+# Real binary: ~/.npm-global/bin/claude
+
+REAL_CLAUDE="$HOME/.npm-global/bin/claude"
+BINDING_DIR="$HOME/.config/upb"
+SESSION_BINDING="$BINDING_DIR/session-binding.env"
+DEFAULT_BINDING="$BINDING_DIR/default-binding.env"
+
+if [ -f "$SESSION_BINDING" ]; then
+    # Active UPB session — use the bound route
+    set -a
+    source "$SESSION_BINDING"
+    set +a
+elif [ -f "$DEFAULT_BINDING" ]; then
+    # No active session — use the default route
+    set -a
+    source "$DEFAULT_BINDING"
+    set +a
+else
+    # Fallback: neither binding file exists (should not happen).
+    # Use the persistent alibaba router directly.
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8705"
+    export ANTHROPIC_AUTH_TOKEN="claude-alibaba-poser"
+    export ANTHROPIC_MODEL="qwen3.8-max-preview"
+    export CLAUDE_CODE_SUBAGENT_MODEL="qwen3.8-max-preview"
+fi
+
+exec "$REAL_CLAUDE" "$@"
