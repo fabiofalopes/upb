@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-"""upb — route control for Claude Code over the Universal Provider Bridge.
-
-Single source of truth: ~/.config/upb/routes.yaml (override: $UPB_ROUTES).
-Replaces the claude-* launcher graveyard. Secrets are referenced, never
-stored here or printed.
-
-Usage:
-  upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
-  upb models PROVIDER [--refresh] [--json]
-                                  models of a provider (live fetch for catalog: live)
-  upb status [--json]             key resolution + live endpoint health
-  upb run ROUTE [-- ARGS...]      launch claude through a route
-                                  ROUTE = default | provider | provider/model
-  upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
-  upb default                     show the default route
-  upb doctor                      config, keys, ports, binaries, hygiene
-  upb sync [--full]               pull keys → secrets.env → router.env
-                                  (--full regenerates router.env from scratch)
-  upb env                         print shell exports for the persistent router
-
-Providers with `catalog: live` discover models from /v1/models at runtime;
-any listed model can be run on demand (upb run provider/<model-id>). They
-are never the default route — usage-metered surfaces stay an explicit choice.
-
-Exit codes: 0 ok · 2 config/usage error · 3 no eligible route · 4 spawn failed
-"""
+# upb — route control for Claude Code over the Universal Provider Bridge.
+#
+# Single source of truth: ~/.config/upb/routes.yaml (override: $UPB_ROUTES).
+# Replaces the claude-* launcher graveyard. Secrets are referenced, never
+# stored here or printed.
+#
+# Usage:
+#   upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
+#   upb models PROVIDER [--refresh] [--json]
+#                                   models of a provider (live fetch for catalog: live)
+#   upb status [--json]             key resolution + live endpoint health
+#   upb run ROUTE [-- ARGS...]      launch claude through a route
+#                                   ROUTE = default | provider | provider/model
+#   upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
+#   upb default                     show the default route
+#   upb doctor                      config, keys, ports, binaries, hygiene
+#
+# Providers with `catalog: live` discover models from /v1/models at runtime;
+# any listed model can be run on demand (upb run provider/<model-id>). They
+# are never the default route — usage-metered surfaces stay an explicit choice.
+#
+# Exit codes: 0 ok · 2 config/usage error · 3 no eligible route · 4 spawn failed
 
 import argparse
 import json
@@ -48,7 +44,7 @@ except ImportError:
 CONFIG_PATH = Path(os.environ.get("UPB_ROUTES", "~/.config/upb/routes.yaml")).expanduser()
 CACHE_DIR = Path(os.environ.get("UPB_CACHE", "~/.cache/upb")).expanduser()
 SECRETS_PATH = Path(os.environ.get("UPB_SECRETS", "~/.config/upb/secrets.env")).expanduser()
-ROUTER_ENV_PATH = Path(os.environ.get("UPB_ROUTER_ENV", "~/.config/upb/router.env")).expanduser()
+SESSION_BINDING = Path(os.environ.get("UPB_SESSION_BINDING", "~/.config/upb/session-binding.env")).expanduser()
 PORT_RANGE = (9000, 9200)          # dynamic ports for live-catalog routes
 CATALOG_TTL_S = 3600
 
@@ -109,26 +105,6 @@ def parse_date(v):
 
 def short_path(p):
     return str(p).replace(str(Path.home()), "~")
-
-
-def find_router_service():
-    """Detect which router systemd unit exists on this system.
-
-    Prefers upb-router (fresh installs), falls back to universal-router
-    (existing/manual installs). A unit counts as present only if systemd lists
-    it in `list-unit-files` (a missing unit yields no matching row). Never
-    raises; defaults to upb-router when neither unit exists."""
-    for name in ("upb-router", "universal-router"):
-        try:
-            r = subprocess.run(["systemctl", "--user", "list-unit-files", name + ".service"],
-                               capture_output=True, text=True, timeout=5)
-            for line in r.stdout.splitlines():
-                cols = line.split()
-                if cols and cols[0] == name + ".service":
-                    return name
-        except Exception:
-            continue
-    return "upb-router"
 
 
 def resolve_key(spec):
@@ -432,7 +408,45 @@ def build_launch_env(cfg, prov, route, token, base_url):
     env.update(prov.get("claude_env") or {})
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = token
+    # Ensure model identity is set for session binding propagation.
+    # Provider-level claude_env (e.g. zai, deepseek) may already define these;
+    # for UPB proxy routes, default to the route's model name.
+    if "ANTHROPIC_MODEL" not in env:
+        env["ANTHROPIC_MODEL"] = route["model"]
+    if "CLAUDE_CODE_SUBAGENT_MODEL" not in env:
+        env["CLAUDE_CODE_SUBAGENT_MODEL"] = route["model"]
     return env
+
+
+def write_session_binding(env, route):
+    """Persist the launch env as a session-binding file so that sub-sessions
+    and workflow relaunches stay bound to the same model/route.
+
+    The ~/.local/bin/claude wrapper reads this file on every invocation.
+    Cleared by `upb stop`.
+    """
+    lines = [
+        f"# UPB session binding — written by `upb run {fmt_route_name(route)}`",
+        f"# {datetime.now().isoformat(timespec='seconds')}",
+    ]
+    # Core routing vars
+    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+        if key in env:
+            lines.append(f"{key}={env[key]}")
+    # Model identity for diagnostics
+    lines.append(f"UPB_BOUND_ROUTE={fmt_route_name(route)}")
+    SESSION_BINDING.parent.mkdir(parents=True, exist_ok=True)
+    SESSION_BINDING.write_text("\n".join(lines) + "\n")
+    SESSION_BINDING.chmod(0o600)
+
+
+def clear_session_binding():
+    """Remove the session-binding file (restores default route behaviour)."""
+    if SESSION_BINDING.exists():
+        SESSION_BINDING.unlink()
+        return True
+    return False
 
 
 def print_route_block(route, prov, endpoint_desc, key_desc):
@@ -623,6 +637,7 @@ def cmd_run(cfg, args):
 
     print_route_block(route, prov, endpoint_desc, key_desc)
     env = build_launch_env(cfg, prov, route, token, base_url)
+    write_session_binding(env, route)
     binary = claude_binary()
     print(f"Launching claude ({route['model']})...", file=sys.stderr)
     os.execve(binary, ["claude"] + args.claude_args, env)
@@ -690,6 +705,9 @@ def cmd_stop(cfg, args):
                 stopped += 1
     if stopped == 0 and args.all:
         print("[upb] nothing upb-managed to stop")
+    # Clear session binding so subsequent bare `claude` uses the default route
+    if clear_session_binding():
+        print("[upb] session binding cleared — default route restored")
     return 0
 
 
@@ -746,14 +764,27 @@ def cmd_doctor(cfg, args):
     check("legacy claude-* launchers removed", not legacy,
           f"{len(legacy)} remain: {', '.join(legacy[:6])}{'…' if len(legacy) > 6 else ''}" if legacy else "")
     # systemd-managed proxy awareness
-    svc = find_router_service()
     try:
-        active = subprocess.run(["systemctl", "--user", "is-active", svc],
+        active = subprocess.run(["systemctl", "--user", "is-active", "universal-router"],
                                 capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         active = "unknown"
-    print(f" • {svc}.service (systemd): {active}"
+    print(f" • universal-router.service (systemd): {active}"
           + (" — upb reuses :8705 and will never stop it" if active == "active" else ""))
+
+    print("session binding")
+    wrapper = Path("~/.local/bin/claude").expanduser()
+    check("claude wrapper installed", wrapper.exists() and os.access(wrapper, os.X_OK),
+          str(wrapper))
+    default_b = Path("~/.config/upb/default-binding.env").expanduser()
+    check("default-binding.env present", default_b.exists(), str(default_b))
+    if SESSION_BINDING.exists():
+        content = SESSION_BINDING.read_text()
+        route_line = next((l for l in content.splitlines() if l.startswith("UPB_BOUND_ROUTE=")), None)
+        route_name = route_line.split("=", 1)[1] if route_line else "unknown"
+        print(f" • ACTIVE binding: {route_name}")
+    else:
+        print(" • no active session binding (default route in effect)")
     return 0 if ok else 2
 
 
@@ -765,7 +796,7 @@ def cmd_env(cfg, args):
     port = (cfg.get("defaults") or {}).get("port", 8705)
     # Read LOCAL_SECRET from the systemd env file (source of truth for the service)
     secret = "claude-universal-local"
-    router_env = ROUTER_ENV_PATH
+    router_env = Path("~/shared-local/reports/claude-universal/router-alibaba.env").expanduser()
     if router_env.exists():
         for line in router_env.read_text().splitlines():
             if line.startswith("LOCAL_SECRET="):
@@ -780,91 +811,6 @@ def cmd_env(cfg, args):
 
 
 # ── sync ─────────────────────────────────────────────────────────────
-
-def _gen_local_secret():
-    """Stable-format random local secret: upb-local-<12 hex chars>."""
-    return "upb-local-" + os.urandom(6).hex()
-
-
-def _default_target(cfg):
-    """(provider_name, prov, model) for the persistent default route, or None.
-
-    Mirrors iter_routes' first-eligible selection: lowest priority number,
-    enabled, key resolvable, non-catalog. Model = the one marked primary:true,
-    else the first listed model."""
-    for pname, prov in sorted_providers(cfg):
-        if is_catalog(prov):
-            continue
-        if provider_issues(prov):
-            continue
-        models = prov.get("models") or {}
-        if not models:
-            continue
-        primary = next((m for m, mc in models.items() if (mc or {}).get("primary")), None)
-        model = primary or next(iter(models))
-        return pname, prov, model
-    return None
-
-
-def _read_existing_local_secret():
-    if not ROUTER_ENV_PATH.exists():
-        return None
-    for line in ROUTER_ENV_PATH.read_text().splitlines():
-        if line.startswith("LOCAL_SECRET="):
-            return line.split("=", 1)[1].strip().strip("'\"") or None
-    return None
-
-
-def _generate_router_env(cfg, secrets):
-    """Generate a complete router.env that drives the router in single-provider
-    mode (UPB_* env vars — see router/src/middleware/router-config.ts buildFromEnv).
-    Returns the LOCAL_SECRET used, or None on failure."""
-    # Make freshly-pulled secrets visible to resolve_key (it reads os.environ).
-    for k, v in secrets.items():
-        if v:
-            os.environ[k] = v
-
-    target = _default_target(cfg)
-    if target is None:
-        print("upb sync: no eligible default provider — cannot generate router.env",
-              file=sys.stderr)
-        return None
-    pname, prov, model = target
-
-    key_value, key_desc = resolve_key(prov.get("key"))
-    if prov.get("key") not in (None, "none") and key_value is None:
-        print(f"upb sync: warning: key unavailable for {pname} ({key_desc}); "
-              f"writing router.env with empty UPB_API_KEY — add it to "
-              f"{short_path(SECRETS_PATH)} and re-run", file=sys.stderr)
-
-    port = (cfg.get("defaults") or {}).get("port", 8705)
-    local_secret = _read_existing_local_secret() or _gen_local_secret()
-
-    # Model map: every Claude wire name AND the provider's own model id resolve
-    # to the target upstream model. Shape matches router-config.ts buildFromEnv
-    # (JSON.parse) and index.ts resolveProvider (exact model_map[model] lookup).
-    model_map = {w: model for w in WIRE_NAMES}
-    model_map[model] = model
-
-    upb_provider = prov.get("upb_provider", pname)
-    lines = [
-        "# upb router env — drives the router in single-provider (UPB_*) mode",
-        "# Generated by: upb sync — do not hand-edit UPB_MODEL_MAP",
-        f"PORT={port}",
-        f"UPB_PROVIDER={upb_provider}",
-        f"UPB_BASE_URL={prov['base_url']}",
-        f"UPB_API_KEY='{key_value or ''}'",
-        f"UPB_MODEL_MAP='{json.dumps(model_map)}'",
-        f"LOCAL_SECRET={local_secret}",
-        "",
-    ]
-    ROUTER_ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ROUTER_ENV_PATH.write_text("\n".join(lines))
-    ROUTER_ENV_PATH.chmod(0o600)
-    print(f"upb sync: generated {short_path(ROUTER_ENV_PATH)} "
-          f"(provider={upb_provider}, model={model}, port={port})")
-    return local_secret
-
 
 def discover_new_models(cfg):
     """For providers flagged `discover: true`, report upstream models not yet in routes.yaml.
@@ -990,35 +936,28 @@ def cmd_sync(cfg, args):
     for c in changed:
         print(f"  • {c}")
 
-    # ── Push: secrets.env → router env file ──
-    router_env = ROUTER_ENV_PATH
-    full = getattr(args, "full", False)
-    if full or not router_env.exists():
-        # Full generation: single-provider mode env for the default route.
-        _generate_router_env(cfg, secrets)
-    else:
-        # In-place refresh (existing behavior): update UPB_API_KEY only.
-        ali_key = secrets.get("ALIBABA_TOKEN_PLAN_KEY", "")
-        if ali_key:
-            content = router_env.read_text()
-            new_content = _re.sub(
-                r"^UPB_API_KEY=.*$",
-                f"UPB_API_KEY='{ali_key}'",
-                content, flags=_re.MULTILINE)
-            if new_content != content:
-                router_env.write_text(new_content)
-                router_env.chmod(0o600)
-                print(f"  • pushed ALIBABA_TOKEN_PLAN_KEY → {short_path(router_env)}")
-                # Restart systemd service to pick up new key
-                svc = find_router_service()
-                try:
-                    subprocess.run(["systemctl", "--user", "restart", svc + ".service"],
-                                   capture_output=True, timeout=10)
-                    print(f"  • restarted {svc}.service")
-                except Exception as e:
-                    print(f"  • warning: service restart failed: {e}", file=sys.stderr)
-            else:
-                print(f"  • {short_path(router_env)} already in sync")
+    # ── Push: secrets.env → router-alibaba.env ──
+    router_env = Path("~/shared-local/reports/claude-universal/router-alibaba.env").expanduser()
+    ali_key = secrets.get("ALIBABA_TOKEN_PLAN_KEY", "")
+    if ali_key and router_env.exists():
+        content = router_env.read_text()
+        new_content = _re.sub(
+            r"^UPB_API_KEY=.*$",
+            f"UPB_API_KEY='{ali_key}'",
+            content, flags=_re.MULTILINE)
+        if new_content != content:
+            router_env.write_text(new_content)
+            router_env.chmod(0o600)
+            print(f"  • pushed ALIBABA_TOKEN_PLAN_KEY → {short_path(router_env)}")
+            # Restart systemd service to pick up new key
+            try:
+                subprocess.run(["systemctl", "--user", "restart", "universal-router.service"],
+                               capture_output=True, timeout=10)
+                print("  • restarted universal-router.service")
+            except Exception as e:
+                print(f"  • warning: service restart failed: {e}", file=sys.stderr)
+        else:
+            print(f"  • {short_path(router_env)} already in sync")
 
     # ── Model discovery: report new upstream models for discover:true providers ──
     if not getattr(args, "no_discover", False):
@@ -1055,8 +994,6 @@ def main():
     sub.add_parser("default")
     sub.add_parser("doctor")
     p_sync = sub.add_parser("sync")
-    p_sync.add_argument("--full", action="store_true",
-                        help="force full regeneration of router.env")
     p_sync.add_argument("--no-discover", action="store_true",
                         help="skip the new-model discovery check")
     sub.add_parser("env")
