@@ -17,9 +17,12 @@ import { translateRequest, translateResponse, translateError, estimateTokenCount
 import { AnthropicStreamTransformer, createKeepaliveStream } from './utils/stream.js';
 import { getAdapter, listAdapters } from './adapters/registry.js';
 import { classifyError, shouldRetry, getRetryDelay, ErrorCategory } from './utils/errors.js';
-import { logUsage, extractUsage, extractUsageFromSSE } from './utils/usage-logger.js';
+import { logUsage, extractUsage, extractUsageFromSSE, computeCostUsd, aggregateUsage } from './utils/usage-logger.js';
+import { CooldownRegistry, DEFAULT_COOLDOWN_SECONDS, ProviderQuarantinedError } from './utils/cooldown.js';
+import { mergeProviderHeaders } from './utils/headers.js';
 import type { AnthropicRequest } from './types/anthropic.js';
 import type { ProviderAdapter } from './adapters/types.js';
+import type { ModelPricing } from './middleware/router-config.js';
 
 // ── Configuration ──
 
@@ -27,6 +30,14 @@ const routerCfg = loadRouterConfig();
 const PORT = routerCfg.defaults.port;
 const MAX_RETRIES = routerCfg.defaults.retries;
 const LOCAL_SECRET = process.env.LOCAL_SECRET || routerCfg.defaults.local_secret;
+
+// ── Provider Cooldown ──
+
+const cooldownOverrides: Record<string, number> = {};
+for (const [name, def] of Object.entries(routerCfg.providers)) {
+  if (typeof def.cooldown_seconds === 'number') cooldownOverrides[name] = def.cooldown_seconds;
+}
+const cooldown = new CooldownRegistry(DEFAULT_COOLDOWN_SECONDS, cooldownOverrides);
 
 // ── Provider Resolution ──
 
@@ -101,6 +112,36 @@ function resolveProvider(
   throw new Error(`No providers configured and no env-var fallback available`);
 }
 
+function providerServesModel(def: ProviderDefinition, model: string): boolean {
+  if (def.models && def.models[model]) return true;
+  if (def.model_map && Object.values(def.model_map).includes(model)) return true;
+  return false;
+}
+
+function findAlternateProvider(model: string, exclude: string): ResolvedProvider | null {
+  for (const [name, def] of Object.entries(routerCfg.providers)) {
+    if (name === exclude) continue;
+    if (def.enabled === false) continue;
+    if (def.kind === 'anthropic-native') continue; // no translation proxy → cannot fail over
+    if (cooldown.isQuarantined(name)) continue;
+    if (!providerServesModel(def, model)) continue;
+    return { name, definition: def, adapter: getAdapterForProvider(name, def), model };
+  }
+  return null;
+}
+
+// If the resolved provider is quarantined, fail over to an enabled kind: upb
+// alternate serving the same model; otherwise throw for a fast, clear failure.
+function enforceCooldown(resolved: ResolvedProvider): ResolvedProvider {
+  if (!cooldown.isQuarantined(resolved.name)) return resolved;
+  const alternate = findAlternateProvider(resolved.model, resolved.name);
+  if (alternate) {
+    console.log(`[cooldown] FAILOVER ${resolved.name} → ${alternate.name} for ${resolved.model} (${cooldown.remainingSeconds(resolved.name)}s quarantine remaining)`);
+    return alternate;
+  }
+  throw new ProviderQuarantinedError(resolved.name, cooldown.remainingSeconds(resolved.name), resolved.model);
+}
+
 function getAdapterForProvider(name: string, def: ProviderDefinition): ProviderAdapter {
   // Built-in adapters
   const known: Record<string, Partial<ProviderAdapter>> = {
@@ -121,6 +162,10 @@ function getAdapterForProvider(name: string, def: ProviderDefinition): ProviderA
     transformError: (e) => e,
     extraHeaders: def.extra_headers || {},
   };
+}
+
+function pricingFor(def: ProviderDefinition, model: string): ModelPricing | undefined {
+  return def.models?.[model]?.pricing;
 }
 
 // ── Server ──
@@ -164,6 +209,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       version: routerCfg.version,
       providers: Object.keys(routerCfg.providers),
       active_provider: routerCfg.active_provider,
+      cooldowns: cooldown.snapshot(),
       uptime: process.uptime(),
     }));
     return;
@@ -256,10 +302,11 @@ async function handleOpenAIRequest(req: http.IncomingMessage, res: http.ServerRe
   // Resolve provider
   let resolved: ResolvedProvider;
   try {
-    resolved = resolveProvider(model);
+    resolved = enforceCooldown(resolveProvider(model));
   } catch (err) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: (err as Error).message, type: 'api_error' } }));
+    const quarantined = err instanceof ProviderQuarantinedError;
+    res.writeHead(quarantined ? 503 : 502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: (err as Error).message, type: quarantined ? 'overloaded_error' : 'api_error' } }));
     return;
   }
 
@@ -289,7 +336,7 @@ async function handleOpenAIRequest(req: http.IncomingMessage, res: http.ServerRe
   };
 
   // Forward with retry
-  await forwardToProvider(providerUrl, outboundHeaders, outboundBody, isStream, res, resolved.adapter, model);
+  await forwardToProvider(providerUrl, outboundHeaders, outboundBody, isStream, res, resolved, model);
 }
 
 // ── Anthropic Intake Handler (for Claude Code) ──
@@ -320,12 +367,13 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
   // Resolve provider from model name
   let resolved: ResolvedProvider;
   try {
-    resolved = resolveProvider(body.model);
+    resolved = enforceCooldown(resolveProvider(body.model));
   } catch (err) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
+    const quarantined = err instanceof ProviderQuarantinedError;
+    res.writeHead(quarantined ? 503 : 502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       type: 'error',
-      error: { type: 'api_error', message: (err as Error).message },
+      error: { type: quarantined ? 'overloaded_error' : 'api_error', message: (err as Error).message },
     }));
     return;
   }
@@ -362,6 +410,9 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
   if (resolvedKey) {
     outboundHeaders['Authorization'] = `Bearer ${resolvedKey}`;
   }
+  if (resolved.definition.headers) {
+    mergeProviderHeaders(outboundHeaders, resolved.definition.headers);
+  }
 
   // Forward with retry
   if (body.stream) {
@@ -386,6 +437,10 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
       });
 
       if (!providerRes.ok) {
+        if (providerRes.status === 429) {
+          cooldown.mark(resolved.name);
+          console.warn(`[cooldown] ${resolved.name} marked for ${cooldown.remainingSeconds(resolved.name)}s (429 rate limit)`);
+        }
         const errorBody = await providerRes.text().catch(() => '');
         res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: `Provider ${providerRes.status}: ${errorBody.slice(0, 200)}` } })}\n\n`);
         res.end();
@@ -395,6 +450,7 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
       if (providerRes.body) {
         const reader = providerRes.body.getReader();
         let streamUsageLogged = false;
+        const streamPricing = pricingFor(resolved.definition, resolved.model);
         const pump = async (): Promise<void> => {
           try {
             while (true) {
@@ -413,6 +469,7 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
                     model: resolved.model,
                     wire_model: body.model,
                     ...usage,
+                    cost_usd: computeCostUsd(streamPricing, usage),
                     stream: true,
                   });
                 }
@@ -439,7 +496,7 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
     }
   } else {
     // Non-streaming
-    await forwardToProvider(providerUrl, outboundHeaders, openaiRequest, false, res, resolved.adapter, body.model, true);
+    await forwardToProvider(providerUrl, outboundHeaders, openaiRequest, false, res, resolved, body.model, true);
   }
 }
 
@@ -479,11 +536,19 @@ async function forwardToProvider(
   body: Record<string, unknown>,
   isStream: boolean,
   res: http.ServerResponse,
-  adapter: ProviderAdapter,
+  resolved: ResolvedProvider,
   originalModel: string,
   translateResponse_toAnthropic = false,
 ): Promise<void> {
+  const adapter = resolved.adapter;
+  const routeModel = typeof body.model === 'string' ? body.model : undefined;
+  const pricing = routeModel ? pricingFor(resolved.definition, routeModel) : undefined;
   let lastError: { statusCode: number; text: string } | null = null;
+
+  // Provider custom headers land after auth injection and cannot clobber it
+  if (resolved.definition.headers) {
+    mergeProviderHeaders(headers, resolved.definition.headers);
+  }
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -513,9 +578,19 @@ async function forwardToProvider(
         const category = classifyError(providerRes.status, errorType);
         console.error(`[proxy] Provider error: ${providerRes.status} ${errorType} [${category}]`);
 
+        if (providerRes.status === 429) {
+          cooldown.mark(resolved.name);
+          console.warn(`[cooldown] ${resolved.name} marked for ${cooldown.remainingSeconds(resolved.name)}s (429 rate limit)`);
+        }
+
         if (shouldRetry(category, attempt, MAX_RETRIES)) {
           lastError = { statusCode: providerRes.status, text: errorText };
           continue;
+        }
+
+        if (category === ErrorCategory.RETRYABLE) {
+          cooldown.mark(resolved.name);
+          console.warn(`[cooldown] ${resolved.name} marked for ${cooldown.remainingSeconds(resolved.name)}s (retries exhausted: ${providerRes.status})`);
         }
 
         if (translateResponse_toAnthropic) {
@@ -562,6 +637,7 @@ async function forwardToProvider(
                         model: (body as Record<string, unknown>).model as string || 'unknown',
                         wire_model: originalModel,
                         ...usage,
+                        cost_usd: computeCostUsd(pricing, usage),
                         stream: true,
                       });
                     }
@@ -600,6 +676,7 @@ async function forwardToProvider(
                         model: (body as Record<string, unknown>).model as string || 'unknown',
                         wire_model: originalModel,
                         ...usage,
+                        cost_usd: computeCostUsd(pricing, usage),
                         stream: true,
                       });
                     }
@@ -628,6 +705,7 @@ async function forwardToProvider(
             model: (body as Record<string, unknown>).model as string || 'unknown',
             wire_model: originalModel,
             ...usage,
+            cost_usd: computeCostUsd(pricing, usage),
             stream: false,
           });
         }
@@ -688,49 +766,14 @@ async function handleUsageSummary(res: http.ServerResponse): Promise<void> {
   const { readFileSync, existsSync } = await import('node:fs');
   const USAGE_LOG = process.env.USAGE_LOG || path.join(process.cwd(), 'usage.jsonl');
 
-  if (!existsSync(USAGE_LOG)) {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ total_requests: 0, total_prompt_tokens: 0, total_completion_tokens: 0, total_tokens: 0, by_provider: {}, by_model: {} }));
-    return;
-  }
+  const lines = existsSync(USAGE_LOG)
+    ? readFileSync(USAGE_LOG, 'utf-8').trim().split('\n').filter(Boolean)
+    : [];
 
-  const lines = readFileSync(USAGE_LOG, 'utf-8').trim().split('\n').filter(Boolean);
-  let totalPrompt = 0, totalCompletion = 0, totalTokens = 0;
-  const byProvider: Record<string, { requests: number; prompt_tokens: number; completion_tokens: number; total_tokens: number }> = {};
-  const byModel: Record<string, { requests: number; prompt_tokens: number; completion_tokens: number; total_tokens: number }> = {};
-
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      totalPrompt += entry.prompt_tokens || 0;
-      totalCompletion += entry.completion_tokens || 0;
-      totalTokens += entry.total_tokens || 0;
-
-      const prov = entry.provider || 'unknown';
-      if (!byProvider[prov]) byProvider[prov] = { requests: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-      byProvider[prov].requests++;
-      byProvider[prov].prompt_tokens += entry.prompt_tokens || 0;
-      byProvider[prov].completion_tokens += entry.completion_tokens || 0;
-      byProvider[prov].total_tokens += entry.total_tokens || 0;
-
-      const model = entry.model || 'unknown';
-      if (!byModel[model]) byModel[model] = { requests: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-      byModel[model].requests++;
-      byModel[model].prompt_tokens += entry.prompt_tokens || 0;
-      byModel[model].completion_tokens += entry.completion_tokens || 0;
-      byModel[model].total_tokens += entry.total_tokens || 0;
-    } catch { /* skip malformed lines */ }
-  }
+  const summary = aggregateUsage(lines);
 
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-  res.end(JSON.stringify({
-    total_requests: lines.length,
-    total_prompt_tokens: totalPrompt,
-    total_completion_tokens: totalCompletion,
-    total_tokens: totalTokens,
-    by_provider: byProvider,
-    by_model: byModel,
-  }, null, 2));
+  res.end(JSON.stringify(summary, null, 2));
 }
 
 // ── Helpers ──

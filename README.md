@@ -129,6 +129,12 @@ curl -s http://127.0.0.1:8705/usage
 Returns totals plus breakdowns by provider and by model — handy when you are
 evaluating which provider earns its keep.
 
+When a model carries a `pricing` block in `routes.yaml` (`input_per_1m` /
+`output_per_1m`, USD per 1M tokens), each log entry also gets a computed
+`cost_usd` (`null` for unpriced models), and `/usage` reports cost totals —
+overall plus per provider and per model. Legacy log lines without `cost_usd`
+still aggregate fine (they count tokens, add $0).
+
 ## Provider support
 
 Providers are declared in `~/.config/upb/routes.yaml`. `kind: upb` routes go
@@ -143,6 +149,7 @@ Anthropic protocol directly and are passed through without a local proxy.
 | `litellm` | upb | yes | LiteLLM gateway (multi-model) |
 | `prime-intellect` | upb | yes | Pay-per-use, `catalog: live` (explicit runs only) |
 | `zen` | upb | no | OpenCode Zen free tier |
+| `mistral` | upb | yes | Vibe subscription; UA header required |
 | `ollama` | upb | yes | Local or cloud Ollama |
 
 Keys are referenced by env-var name in `routes.yaml` and resolved from

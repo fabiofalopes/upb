@@ -107,6 +107,29 @@ def short_path(p):
     return str(p).replace(str(Path.home()), "~")
 
 
+def fmt_duration(secs):
+    secs = int(secs)
+    if secs >= 3600:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    if secs >= 60:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs}s"
+
+
+def router_cooldowns(cfg):
+    """Active provider cooldowns from the persistent router's /health.
+
+    Returns {provider: remaining_seconds}, or None when the router is
+    unreachable or has nothing quarantined."""
+    port = (cfg.get("defaults") or {}).get("port", 8705)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2.0) as resp:
+            cooldowns = json.loads(resp.read()).get("cooldowns") or {}
+    except Exception:
+        return None
+    return cooldowns or None
+
+
 def resolve_key(spec):
     """Return (value_or_None, human_description). Never print the value."""
     if spec is None or spec == "none":
@@ -571,11 +594,17 @@ def cmd_status(cfg, args):
         for pname, key_ok, desc, state, detail in ex.map(probe, list(provs)):
             results[pname] = (key_ok, desc, state, detail)
 
+    cds = router_cooldowns(cfg)
+
     if args.json:
         out = [{"provider": p, "key": results[p][1], "key_source": results[p][0],
                 "health": results[p][2], "detail": results[p][3],
                 "enabled": provs[p].get("enabled", True),
                 "catalog": is_catalog(provs[p])} for p in results]
+        if cds:
+            for row in out:
+                if row["provider"] in cds:
+                    row["cooldown_seconds"] = cds[row["provider"]]
         print(json.dumps(out, indent=2))
         return 0
 
@@ -591,6 +620,8 @@ def cmd_status(cfg, args):
         if is_catalog(provs[pname]):
             n = len(cached_catalog(pname) or [])
             flags.append(f"live catalog{f', {n} cached' if n else ''}")
+        if cds and pname in cds:
+            flags.append(f"cooldown {fmt_duration(cds[pname])}")
         suffix = f"  ({', '.join(flags)})" if flags else ""
         key_col = "ok" if key_ok else "MISSING"
         print(f"{pname:<{w}}  {key_col:<8} {state:<11} {detail}{suffix}")
@@ -911,7 +942,8 @@ def cmd_sync(cfg, args):
             pass
 
     # ── Pull: env vars that should be persisted ──
-    for var in ("ZAI_API_KEY", "PRIME_INTELLECT_API_KEY", "OLLAMA_API_KEY", "DEEPSEEK_API_KEY"):
+    for var in ("ZAI_API_KEY", "PRIME_INTELLECT_API_KEY", "OLLAMA_API_KEY",
+                "DEEPSEEK_API_KEY", "MISTRAL_API_KEY"):
         env_val = os.environ.get(var, "")
         if env_val and secrets.get(var) != env_val:
             secrets[var] = env_val

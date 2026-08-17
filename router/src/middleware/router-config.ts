@@ -10,17 +10,32 @@ import YAML from 'yaml';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Per-model pricing (USD per 1M tokens) — powers cost_usd in the usage log
+export interface ModelPricing {
+  input_per_1m: number;
+  output_per_1m: number;
+}
+
+export interface ModelDefinition {
+  pricing?: ModelPricing;
+}
+
 export interface ProviderDefinition {
   type: 'openai_compatible';
   base_url: string;
   api_key?: string;
   model_map?: Record<string, string>;
   model_prefix?: string;
+  models?: Record<string, ModelDefinition>;
   timeout: number;
   strip_thinking?: boolean;
   strip_cache_control?: boolean;
   extra_headers?: Record<string, string>;
   icon?: string;
+  kind?: 'upb' | 'anthropic-native'; // upb proxies can fail over; native cannot
+  enabled?: boolean;                 // false → excluded from cooldown failover
+  cooldown_seconds?: number;         // quarantine TTL override (default 300s)
+  headers?: Record<string, string>;  // extra upstream headers; never overrides auth
 }
 
 export interface RouterConfig {
