@@ -149,7 +149,7 @@ Anthropic protocol directly and are passed through without a local proxy.
 | `litellm` | upb | yes | LiteLLM gateway (multi-model) |
 | `prime-intellect` | upb | yes | Pay-per-use, `catalog: live` (explicit runs only) |
 | `zen` | upb | no | OpenCode Zen free tier |
-| `mistral` | upb | yes | Vibe subscription; UA header required |
+| `mistral` | upb | yes | Vibe/Pro subscription — 3 `mistral-vibe-cli-*` models + platform catalog; UA header required |
 | `ollama` | upb | yes | Local or cloud Ollama |
 
 Keys are referenced by env-var name in `routes.yaml` and resolved from
