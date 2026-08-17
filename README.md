@@ -99,6 +99,7 @@ existing config after backing it up). Full reference in
 | `upb default` | Show the default route |
 | `upb doctor` | Config, keys, ports, binaries, hygiene checks |
 | `upb models PROVIDER [--refresh]` | List a provider's models (live fetch for `catalog: live`) |
+| `upb verify [PROVIDER] [--probe] [--json]` | Audit declared models against each provider's live catalog; `--probe` adds a 1-token entitlement check per model (real billable calls on metered models) |
 | `upb sync [--full]` | Pull keys → `secrets.env` → generate/update `router.env` |
 | `upb env` | Print shell exports pointing at the persistent router |
 
@@ -113,7 +114,7 @@ Two commands deserve emphasis:
   `OPENAI_BASE_URL`, and `OPENAI_API_KEY` so any other tool can target the
   proxy: `eval "$(upb env)"`.
 
-Exit codes: `0` ok · `2` config/usage error · `3` no eligible route · `4` spawn failed.
+Exit codes: `0` ok · `2` config/usage error · `3` no eligible route (or `upb verify` findings: missing upstream, listing error, probe non-200) · `4` spawn failed.
 
 ## Usage tracking
 

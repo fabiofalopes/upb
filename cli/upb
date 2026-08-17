@@ -9,6 +9,9 @@
 #   upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
 #   upb models PROVIDER [--refresh] [--json]
 #                                   models of a provider (live fetch for catalog: live)
+#   upb verify [PROVIDER] [--probe] [--json]
+#                                   audit declared models vs live catalogs
+#                                   (--probe: 1-token entitlement check, billable)
 #   upb status [--json]             key resolution + live endpoint health
 #   upb run ROUTE [-- ARGS...]      launch claude through a route
 #                                   ROUTE = default | provider | provider/model
@@ -20,7 +23,8 @@
 # any listed model can be run on demand (upb run provider/<model-id>). They
 # are never the default route — usage-metered surfaces stay an explicit choice.
 #
-# Exit codes: 0 ok · 2 config/usage error · 3 no eligible route · 4 spawn failed
+# Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify findings
+#             · 4 spawn failed
 
 import argparse
 import json
@@ -821,6 +825,134 @@ def cmd_doctor(cfg, args):
     return 0 if ok else 2
 
 
+# ── verify ───────────────────────────────────────────────────────────
+
+def _verify_headers(prov, key):
+    """Request headers for verify: default UA + bearer key + provider `headers:`.
+
+    Router merge rule: provider headers may never override `Authorization` or
+    `x-api-key` (case-insensitive) — the resolved key always wins."""
+    headers = {"User-Agent": "upb-verify/1.0"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    for h, v in (prov.get("headers") or {}).items():
+        if str(h).lower() in ("authorization", "x-api-key"):
+            continue
+        headers[str(h)] = str(v)
+    return headers
+
+
+def _list_provider_models(prov):
+    """GET {base_url}/models for a kind:upb provider. Returns (model_ids, error)."""
+    key, desc = resolve_key(prov.get("key"))
+    if key is None:
+        return None, f"key unavailable ({desc})"
+    url = prov["base_url"].rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers=_verify_headers(prov, key))
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {getattr(e, 'reason', e)}"
+    entries = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return None, "unparseable response (no 'data' list)"
+    ids = [m.get("id") for m in entries if isinstance(m, dict) and m.get("id")]
+    return ids, None
+
+
+def _probe_model(prov, model):
+    """POST a 1-token chat completion. Returns HTTP status int (-1 = transport error)."""
+    key, _ = resolve_key(prov.get("key"))
+    url = prov["base_url"].rstrip("/") + "/chat/completions"
+    body = json.dumps({"model": model,
+                       "messages": [{"role": "user", "content": "hi"}],
+                       "max_tokens": 1}).encode()
+    headers = _verify_headers(prov, key)
+    headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return -1
+
+
+def cmd_verify(cfg, args):
+    """Audit models declared in routes.yaml against each provider's live catalog."""
+    if args.provider:
+        prov = cfg["providers"].get(args.provider)
+        if not prov:
+            die(f"unknown provider '{args.provider}'", 2)
+        targets = [(args.provider, prov)]
+    else:
+        targets = [(p, prov) for p, prov in sorted_providers(cfg)
+                   if prov.get("enabled", True) and prov.get("base_url")]
+        if not targets:
+            die("no enabled providers with a base_url to verify", 2)
+    provs = dict(targets)
+
+    def check(pname):
+        prov = provs[pname]
+        if prov.get("kind") == "anthropic-native":
+            return {"skipped": "anthropic-native"}
+        if not prov.get("base_url"):
+            return {"error": "no base_url"}
+        declared = list((prov.get("models") or {}).keys())
+        ids, err = _list_provider_models(prov)
+        if err:
+            return {"error": err}
+        res = {}
+        missing = [m for m in declared if m not in set(ids)]
+        new = [m for m in ids if m not in set(declared)]
+        if missing:
+            res["missing_upstream"] = missing
+        if new:
+            res["new_upstream"] = new
+        res["ok"] = len(declared) - len(missing)
+        if args.probe and declared:
+            res["probe"] = {m: _probe_model(prov, m) for m in declared}
+        return res
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for pname, res in ex.map(lambda p: (p, check(p)), list(provs)):
+            results[pname] = res
+
+    missing_total = sum(len(r.get("missing_upstream") or []) for r in results.values())
+    error_count = sum(1 for r in results.values() if "error" in r)
+    checked = sum(1 for r in results.values() if "error" not in r and "skipped" not in r)
+    probe_bad = sum(1 for r in results.values()
+                    for st in (r.get("probe") or {}).values() if st != 200)
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for pname, res in results.items():
+            print(pname)
+            if "skipped" in res:
+                print(f"  skipped ({res['skipped']})")
+            elif "error" in res:
+                print(f"  listing error: {res['error']}")
+            else:
+                print(f"  ok: {res['ok']} matched")
+                for m in res.get("missing_upstream") or []:
+                    print(f"  ✗ missing upstream: {m}")
+                for m in res.get("new_upstream") or []:
+                    print(f"  + new upstream: {m}")
+                for m, st in (res.get("probe") or {}).items():
+                    st_txt = str(st) if st >= 0 else "transport error"
+                    print(f"  probe {m} -> {st_txt}")
+        print(f"\n{checked} providers checked, {missing_total} missing upstream, "
+              f"{error_count} errors")
+
+    return 3 if (missing_total or error_count or probe_bad) else 0
+
+
 # ── env ──────────────────────────────────────────────────────────────
 
 def cmd_env(cfg, args):
@@ -1017,6 +1149,27 @@ def main():
     p_models.add_argument("provider")
     p_models.add_argument("--refresh", action="store_true")
     p_models.add_argument("--json", action="store_true")
+    p_verify = sub.add_parser(
+        "verify", help="audit declared models against providers' live catalogs",
+        description=("Audit models declared in routes.yaml against each provider's "
+                     "live /models catalog (kind: upb providers; anthropic-native "
+                     "providers are skipped — their endpoints don't serve OpenAI "
+                     "/v1/models). Reports declared models missing upstream (stale "
+                     "ids — the critical finding), new upstream models "
+                     "(informational), and match counts. With --probe, also POSTs "
+                     "a 1-token chat completion per declared model: the "
+                     "authoritative entitlement check, since listing can include "
+                     "unentitled models. Note: --probe makes real (tiny, ~1-token) "
+                     "billable calls on metered models. "
+                     "Exit codes: 0 clean · 2 usage/config error · 3 findings "
+                     "(missing upstream, listing error, or probe non-200)."))
+    p_verify.add_argument("provider", nargs="?",
+                          help="verify only this provider (default: all enabled "
+                               "providers with a base_url)")
+    p_verify.add_argument("--probe", action="store_true",
+                          help="1-token entitlement probe per declared model "
+                               "(billable on metered models)")
+    p_verify.add_argument("--json", action="store_true")
     p_status = sub.add_parser("status")
     p_status.add_argument("--json", action="store_true")
     p_run = sub.add_parser("run")
@@ -1035,9 +1188,10 @@ def main():
     args = parser.parse_args(argv)
     cfg = load_cfg()
     cmd = args.cmd or "list"
-    handlers = {"list": cmd_list, "models": cmd_models, "status": cmd_status,
-                "run": cmd_run, "stop": cmd_stop, "default": cmd_default,
-                "doctor": cmd_doctor, "sync": cmd_sync, "env": cmd_env}
+    handlers = {"list": cmd_list, "models": cmd_models, "verify": cmd_verify,
+                "status": cmd_status, "run": cmd_run, "stop": cmd_stop,
+                "default": cmd_default, "doctor": cmd_doctor, "sync": cmd_sync,
+                "env": cmd_env}
     # `upb` with no subcommand behaves like `upb list`
     if args.cmd is None:
         args.all = False
