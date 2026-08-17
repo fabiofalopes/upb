@@ -28,6 +28,7 @@
 - [ ] **Reconcile live `~/bin/upb` with repo `cli/upb`** — repo is ahead (`sync --full`, `find_router_service`, discovery). Decide: deploy repo→live (set `UPB_ROUTER_ENV` to the live router env) or keep intentionally separate.
 - [ ] **Confirm litellm `ornith-9b` → `bonsai-27b-1bit`** — gateway-side aliasing on `modelos.ai.ulusofona.pt` (see Open questions). Needs the LiteLLM admin / `model_list` check. Nothing to change in upb.
 - [ ] **Adopt new zen free models** — `upb sync` discovery surfaced 5 new `-free` models (mimo-v2.5-free, ling-3.0-flash-free, nemotron-3-ultra-free, laguna-s-2.1-free, longcat-2.0-free). Add wanted ones under `providers.zen.models` in routes.yaml.
+- [ ] **Add pricing for zai/deepseek/prime-intellect/ollama models** (no source data — needs provider price pages).
 
 ## In progress
 
@@ -48,6 +49,7 @@ _(none — claim from Open above)_
 |---|---|---|---|
 | 2026-08-06 | orchestrator + fix-2 | Repo creation, installer, docs, service-name fix, model discovery; live key restructure + usage logging + bare-claude routing; litellm/bonsai diagnosis | `4969aa5`, `d7e07b6`, `4736b3d` |
 | 2026-08-07 | orchestrator | Fixed model override bug: `upb run provider/model` now correctly overrides provider-level `claude_env.ANTHROPIC_MODEL` when a specific model is explicitly requested. Previously `zai/glm-4.7` always launched as `glm-5.2`. | `6daa1fd` |
+| 2026-08-17 | migration-from-panopticon | Implemented P1–P3 of `MIGRATION_FROM_PANOPTICON.md` §6: P1 per-model pricing in routes.yaml + `cost_usd` in the usage log and `/usage` totals; P2 provider cooldown/quarantine (`CooldownRegistry`, 429/retry-exhaustion marking, failover to an enabled `kind: upb` alternate serving the same model, fast-fail 503 otherwise, `/health` cooldowns, `upb status` display, zen 11h TTL) + first test suite in the repo (node:test, 14 tests incl. mock-upstream failover E2E); P3 per-provider `headers:` (auth-header-safe merge) + `mistral` Vibe provider (7 models, ports 8810–8816, pricing) + `MISTRAL_API_KEY` through secrets/sync. | — pending commit — |
 
 ---
 
