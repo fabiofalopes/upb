@@ -171,6 +171,8 @@ providers:
         port: 8901
       omnicoder-9b:
         port: 8903
+      amalia-9b:
+        port: 8902   # ported from panopticon (G10) — the one ULusofona model upb lacked
   prime-intellect:
     label: PrimeIntellect Inference (pay-per-use)
     kind: upb
