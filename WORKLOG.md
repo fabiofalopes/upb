@@ -22,7 +22,7 @@
 
 ## Open (unclaimed)
 
-- [ ] **GitHub remote** — publish the repo. Needs `gh` installed + auth (`apt install gh && gh auth login`), then `gh repo create upb --public --source=. --push`. Currently local-only.
+- [x] **GitHub remote** — done: repo published at https://github.com/fabiofalopes/upb (pushes since 2026-08-17).
 - [ ] **True fresh-box E2E** — run `install.sh` end-to-end on a virgin box/VM. Blocked here (no docker/podman/nspawn). Isolated boot-to-healthy is the best proof so far.
 - [ ] **Alibaba cookie-based usage fetch** — implement per `SPEC-alibaba-cookie-usage.md` (Alibaba has NO API-key usage endpoint; console cookies required). Phase 1 = CLI script, Phase 2 = `upb usage` subcommand.
 - [ ] **Reconcile live `~/bin/upb` with repo `cli/upb`** — repo is ahead (`sync --full`, `find_router_service`, discovery). Decide: deploy repo→live (set `UPB_ROUTER_ENV` to the live router env) or keep intentionally separate.
