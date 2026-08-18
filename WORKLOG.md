@@ -29,6 +29,7 @@
 - [ ] **Confirm litellm `ornith-9b` → `bonsai-27b-1bit`** — gateway-side aliasing on `modelos.ai.ulusofona.pt` (see Open questions). Needs the LiteLLM admin / `model_list` check. Nothing to change in upb.
 - [ ] **Adopt new zen free models** — `upb sync` discovery surfaced 5 new `-free` models (mimo-v2.5-free, ling-3.0-flash-free, nemotron-3-ultra-free, laguna-s-2.1-free, longcat-2.0-free). Add wanted ones under `providers.zen.models` in routes.yaml.
 - [ ] **Add pricing for zai/deepseek/prime-intellect/ollama models** (no source data — needs provider price pages).
+- [ ] **macOS deployment support** — installer currently assumes Linux (systemd unit + apt dep bootstrap). For a local Mac instance: `--skip-deps --no-systemd --no-claude` works (Node 22 + PyYAML present), but needs a launchd user-agent template for the persistent router + Mac-native notes in SETUP.md. Fabric on the Mac is pre-pointed at `http://127.0.0.1:8705/v1` and waiting on this.
 
 ## In progress
 
