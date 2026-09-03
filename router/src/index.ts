@@ -11,6 +11,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import { validateAuth } from './middleware/auth.js';
+import { screenOutgoingBody } from './middleware/privacy.js';
 import { loadConfig } from './middleware/config.js';
 import { loadRouterConfig, type ProviderDefinition, type RouterConfig } from './middleware/router-config.js';
 import { translateRequest, translateResponse, translateError, estimateTokenCount } from './utils/translate.js';
@@ -417,6 +418,12 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
   // Forward with retry
   if (body.stream) {
     // Streaming: set up SSE pipeline
+    const pf = await screenOutgoingBody(openaiRequest as Record<string, unknown>, res);
+    if (!pf.ok) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `privacy screen unavailable (${pf.reason})` } }));
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -548,6 +555,18 @@ async function forwardToProvider(
   // Provider custom headers land after auth injection and cannot clobber it
   if (resolved.definition.headers) {
     mergeProviderHeaders(headers, resolved.definition.headers);
+  }
+
+  const pf = await screenOutgoingBody(body, res);
+  if (!pf.ok) {
+    const payload = { error: { message: `privacy screen unavailable (${pf.reason})`, type: 'api_error' } };
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    if (translateResponse_toAnthropic) {
+      res.end(JSON.stringify(translateError(payload as { error: { message: string; type: string } })));
+    } else {
+      res.end(JSON.stringify(payload));
+    }
+    return;
   }
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
