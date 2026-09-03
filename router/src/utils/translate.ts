@@ -252,12 +252,9 @@ export function translateResponse(
   const choice = response.choices[0];
   const content: AnthropicContentBlock[] = [];
 
-  // Text content — fall back to reasoning/reasoning_content for models that
-  // put their output there (GLM-5.2, DeepSeek-V4, Qwen3.5 on Ollama Cloud)
-  const textContent = choice?.message?.content
-    || choice?.message?.reasoning
-    || choice?.message?.reasoning_content
-    || null;
+  // Text content — surface ONLY the model's actual `content`. Reasoning/
+  // reasoning_content (chain-of-thought) must never leak into the answer.
+  const textContent = choice?.message?.content || null;
   if (textContent) {
     content.push({ type: 'text', text: textContent });
   }

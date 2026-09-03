@@ -6,7 +6,7 @@
 
 ## How to join (any session)
 
-1. **Orient:** read this file, then `README.md` and `docs/SETUP.md`. For the live-system picture see the vault note `Universal Provider Bridge — Project Master Map`.
+1. **Orient:** read this file, then `README.md`, `docs/SETUP.md`, and the strategy layer — `docs/VISION.md` (framing/territory) and `docs/ROADMAP.md` (decision gates, lanes, open questions). For the live-system picture see the vault note `Universal Provider Bridge — Project Master Map`.
 2. **Check "In progress"** — do not duplicate claimed work. If something is stale (claimed long ago, no commits), it may be reclaimable; note the takeover in the session log.
 3. **Pick an "Open" item** (or add a new one). Move it to "In progress" with your session id + date.
 4. **Work in small, well-messaged commits.** Keep the repo secret-free (never commit keys or personal paths).
@@ -30,6 +30,10 @@
 - [ ] **Adopt new zen free models** — `upb sync` discovery surfaced 5 new `-free` models (mimo-v2.5-free, ling-3.0-flash-free, nemotron-3-ultra-free, laguna-s-2.1-free, longcat-2.0-free). Add wanted ones under `providers.zen.models` in routes.yaml.
 - [ ] **Add pricing for zai/deepseek/prime-intellect/ollama models** (no source data — needs provider price pages).
 - [ ] **macOS deployment support** — installer currently assumes Linux (systemd unit + apt dep bootstrap). For a local Mac instance: `--skip-deps --no-systemd --no-claude` works (Node 22 + PyYAML present), but needs a launchd user-agent template for the persistent router + Mac-native notes in SETUP.md. Fabric on the Mac is pre-pointed at `http://127.0.0.1:8705/v1` and waiting on this.
+- [ ] **Close the repo↔live gap (G0)** — map exactly what differs between this repo and the live `~/shared-local/reports/claude-universal/` + `~/bin/upb`, then get repo→live deploy working. Prerequisite for everything below. See `docs/ROADMAP.md`.
+- [ ] **OpenCode provider collapse (G1)** — `[GATED on G0 + live upb health]` collapse OpenCode to a single `upb` provider: verify live upb routes alibaba+litellm → add `upb` provider in `opencode.json` → remap `model` → remove redundant providers from auth store → update `AGENTS.md` model policy. See `docs/ROADMAP.md`.
+- [ ] **Launcher split (G2)** — `[design]` extract the "breaking Claude Code" concern into its own workspace; keep `upb run` embedded as a thin launcher. See `docs/VISION.md` § "The launcher entanglement".
+- [ ] **Local-only spine (G3)** — `[vision]` deploy one upb with only `litellm` models, cloud dropped. See `docs/VISION.md` § "The local-only spine".
 
 ## In progress
 
@@ -50,6 +54,7 @@ _(none — claim from Open above)_
 |---|---|---|---|
 | 2026-08-06 | orchestrator + fix-2 | Repo creation, installer, docs, service-name fix, model discovery; live key restructure + usage logging + bare-claude routing; litellm/bonsai diagnosis | `4969aa5`, `d7e07b6`, `4736b3d` |
 | 2026-08-07 | orchestrator | Fixed model override bug: `upb run provider/model` now correctly overrides provider-level `claude_env.ANTHROPIC_MODEL` when a specific model is explicitly requested. Previously `zai/glm-4.7` always launched as `glm-5.2`. | `6daa1fd` |
+| 2026-08-13 | orchestrator | Wrote strategy layer: `docs/VISION.md` (spine/appliance framing, fleet, launcher entanglement, territory, local-only + small-model thesis) and `docs/ROADMAP.md` (decision gates G0–G4, lanes A–F, open questions, trigger moments). No code. | — |
 | 2026-08-17 | migration-from-panopticon | Implemented P1–P3 of `MIGRATION_FROM_PANOPTICON.md` §6: P1 per-model pricing in routes.yaml + `cost_usd` in the usage log and `/usage` totals; P2 provider cooldown/quarantine (`CooldownRegistry`, 429/retry-exhaustion marking, failover to an enabled `kind: upb` alternate serving the same model, fast-fail 503 otherwise, `/health` cooldowns, `upb status` display, zen 11h TTL) + first test suite in the repo (node:test, 14 tests incl. mock-upstream failover E2E); P3 per-provider `headers:` (auth-header-safe merge) + `mistral` Vibe provider (7 models, ports 8810–8816, pricing) + `MISTRAL_API_KEY` through secrets/sync; upb verify catalog-audit command (listing diff + opt-in 1-token probe) | `bade192`, `e84c047` |
 
 ---
@@ -60,6 +65,7 @@ _(none — claim from Open above)_
 - **litellm `ornith-9b` serves `bonsai-27b-1bit`** (observed in LiteLLM monitoring, 2026-08-06). Verified NOT an upb bug: upb's :8901 proxy sends `ornith-9b` correctly; a direct gateway call with `model:"ornith-9b"` returns `model:"ornith-9b"`. Conclusion: the Lusófona gateway aliases `ornith-9b` → a deployment named `bonsai-27b-1bit` (server-side `model_list`). Gateway admin info endpoints are blocked for this key (`llm_api_routes` only). **Needs gateway-admin confirmation** whether that aliasing is intentional.
 - **Alibaba token plan has a WEEKLY quota** (seen via 429: "1-week quota exhausted, resets <date>"), in addition to any per-5h window. No API-key usage endpoint exists.
 - **`claude` binary fragility** — an npm reinstall can skip postinstall, leaving `claude.exe` as a stub → `OSError: Exec format error`. Fix: `node ~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/install.cjs`.
+- **OpenCode model policy vs provider collapse** — `AGENTS.md` pins `alibaba-token-plan/qwen3.8-max-preview` as the only allowed model. When OpenCode collapses to a single `upb` provider (G1), does the "only model" rule follow the `upb/…` path, and who owns that policy? Open (2026-08-13).
 
 ---
 

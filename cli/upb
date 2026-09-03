@@ -1105,7 +1105,7 @@ def cmd_sync(cfg, args):
     # ── Push: secrets.env → router-alibaba.env ──
     router_env = Path("~/shared-local/reports/claude-universal/router-alibaba.env").expanduser()
     ali_key = secrets.get("ALIBABA_TOKEN_PLAN_KEY", "")
-    if ali_key and router_env.exists():
+    if ali_key and router_env.exists() and "UPB_PROVIDER='alibaba-token-plan'" in router_env.read_text():
         content = router_env.read_text()
         new_content = _re.sub(
             r"^UPB_API_KEY=.*$",
