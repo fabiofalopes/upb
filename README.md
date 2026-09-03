@@ -173,7 +173,7 @@ never removed automatically — the uninstaller prints how to restore it from th
 router/      TypeScript dual-intake proxy (src/, package.json, tsconfig.json)
 cli/         upb — Python route-control CLI
 config/      Example config (routes.yaml, secrets.env, systemd service)
-docs/        ARCHITECTURE.md, SETUP.md
+docs/        ARCHITECTURE.md, SETUP.md, VISION.md, ROADMAP.md
 scripts/     install.sh, uninstall.sh
 WORKLOG.md   Multi-session coordination hub (shared backlog + session log)
 ```

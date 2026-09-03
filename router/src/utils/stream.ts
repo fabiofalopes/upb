@@ -90,9 +90,11 @@ export class AnthropicStreamTransformer extends Transform {
     this.pendingData += chunk.toString('utf-8');
 
     const events = parseSSELines(this.pendingData);
-    // Retain incomplete data (after last \n\n)
+    // Retain incomplete data (after last \n\n); keep everything if no boundary yet
     const lastDoubleNewline = this.pendingData.lastIndexOf('\n\n');
-    this.pendingData = lastDoubleNewline === -1 ? '' : this.pendingData.slice(lastDoubleNewline + 2);
+    if (lastDoubleNewline !== -1) {
+      this.pendingData = this.pendingData.slice(lastDoubleNewline + 2);
+    }
 
     for (const event of events) {
       this.processProviderEvent(event);
@@ -138,14 +140,9 @@ export class AnthropicStreamTransformer extends Transform {
 
     const delta = choice.delta;
 
-    // Resolve content: some reasoning models (GLM-5.2, DeepSeek-V4, Qwen3.5)
-    // put their output in `reasoning` or `reasoning_content` instead of `content`.
-    const deltaAny = delta as Record<string, unknown>;
-    const text: string | null | undefined =
-      delta.content ||
-      (deltaAny.reasoning as string | null | undefined) ||
-      (deltaAny.reasoning_content as string | null | undefined) ||
-      null;
+    // Surface ONLY `content` as visible text. Reasoning/reasoning_content
+    // (chain-of-thought) must never leak into the assistant's answer.
+    const text: string | null | undefined = delta.content || null;
 
     // Handle role assignment (first meaningful chunk)
     // Also skip if only role + empty content but reasoning is present
