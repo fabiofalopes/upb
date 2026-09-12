@@ -88,5 +88,12 @@ function getAdapterDefaults(adapterName: string): AdapterDefaults {
     },
   };
 
-  return defaults[adapterName] || defaults['openai-gpt']!;
+  return defaults[adapterName] ?? failUnknownAdapter(adapterName);
+}
+
+function failUnknownAdapter(name: string): never {
+  throw new Error(
+    `[config] Unknown adapter '${name}'. Refusing to start with a silent paid fallback. ` +
+    `Valid adapters: glm-zai, ollama-local, openai-gpt, zen.`
+  );
 }
