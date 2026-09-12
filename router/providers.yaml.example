@@ -102,5 +102,26 @@ providers:
       claude-sonnet-4-6: ollama/qwen2.5-coder:14b
       claude-haiku-4-5: ollama/llama3.2:3b
 
+  # ── 6. TokenRouter (free lane) ──
+  # $0/M-token OpenAI-compatible lane. Reasoning model upstream: keep thinking
+  # passthrough, generous timeout, budget >=1k max_tokens per call. No
+  # concurrency gain (parallel calls queue server-side) — sequential use.
+  # Key: TOKENROUTER_API_KEY in router.env (Vaultwarden: tokenrouter_api_key).
+  # Measured 2026-09-10: 10-70s latency, correct output, no rate-limit headers.
+  tokenrouter:
+    type: openai_compatible
+    base_url: https://api.tokenrouter.com/v1
+    api_key: ${TOKENROUTER_API_KEY:-}
+    timeout: 180000
+    strip_thinking: false
+    strip_cache_control: true
+    model_prefix: tokenrouter
+    models:
+      "z-ai/glm-5.3-free":
+        pricing: { input_per_1m: 0, output_per_1m: 0 }
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free":
+        pricing: { input_per_1m: 0, output_per_1m: 0 }
+    cooldown_seconds: 120
+
 # Default provider when no model prefix matches
 active_provider: litellm
