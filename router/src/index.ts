@@ -216,34 +216,31 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
 
-  // ── GET /v1/models — List available models ──
+  // ── GET /v1/models — capability-derived listing ──
+  // Advertises ONLY what actually routes: prefix wildcards + declared models +
+  // model_map wire names (bare names work only when a map entry translates them).
+  // The old hardcoded claude-* trio is gone: no map entry, no advertisement.
   if (req.method === 'GET' && req.url === '/v1/models') {
     const models: Array<{ id: string; object: string; created: number; owned_by: string }> = [];
     const now = Math.floor(Date.now() / 1000);
+    const seen = new Set<string>();
+    const push = (id: string, owner: string) => {
+      if (!seen.has(id)) {
+        seen.add(id);
+        models.push({ id, object: 'model', created: now, owned_by: owner });
+      }
+    };
 
     for (const [name, def] of Object.entries(routerCfg.providers)) {
-      // If provider has a model_map, expose those
-      if (def.model_map) {
-        for (const [wireName, mappedModel] of Object.entries(def.model_map)) {
-          models.push({
-            id: mappedModel,
-            object: 'model',
-            created: now,
-            owned_by: name,
-          });
-        }
+      // Prefix routing: "litellm/anything" reaches this provider.
+      push(`${name}/*`, name);
+      // Declared models: exact "prefix/model" wire names.
+      for (const modelId of Object.keys(def.models || {})) {
+        push(`${name}/${modelId}`, name);
       }
-    }
-
-    // Also expose claude-* wire names for Claude Code compatibility
-    for (const wireName of ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5']) {
-      if (!models.find(m => m.id === wireName)) {
-        models.push({
-          id: wireName,
-          object: 'model',
-          created: now,
-          owned_by: 'universal-router',
-        });
+      // model_map keys: bare wire names that translate to something real.
+      for (const wireName of Object.keys(def.model_map || {})) {
+        push(wireName, name);
       }
     }
 
