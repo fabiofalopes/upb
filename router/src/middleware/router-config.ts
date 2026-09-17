@@ -35,6 +35,7 @@ export interface ProviderDefinition {
   kind?: 'upb' | 'anthropic-native'; // upb proxies can fail over; native cannot
   enabled?: boolean;                 // false → excluded from cooldown failover
   cooldown_seconds?: number;         // quarantine TTL override (default 300s)
+  max_parallel?: number;              // per-provider concurrency cap; 1 = FIFO sequential (free-tier doctrine)
   headers?: Record<string, string>;  // extra upstream headers; never overrides auth
 }
 
