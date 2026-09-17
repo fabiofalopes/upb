@@ -9,7 +9,7 @@ import type http from 'node:http';
 
 const SOCKET_PATH = process.env.PF_SCREEN_SOCKET || '/run/pf-screen.sock';
 const DISABLED = process.env.PF_SCREEN_DISABLE === '1';
-const SCREEN_TIMEOUT_MS = 180_000;
+const SCREEN_TIMEOUT_MS = Number(process.env.PF_SCREEN_TIMEOUT_MS || 180_000);
 
 // Namespaces the text cache: bump when daemon threshold/policy config changes
 // so stale redaction results are not reused across the epoch boundary.
