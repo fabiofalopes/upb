@@ -74,7 +74,7 @@ providers:
 active_provider: mock-a
 `);
 
-  const ENV_KEYS = ['UPB_CONFIG', 'UPB_PROVIDER', 'UPB_BASE_URL', 'USAGE_LOG'];
+  const ENV_KEYS = ['UPB_CONFIG', 'UPB_PROVIDER', 'UPB_BASE_URL', 'USAGE_LOG', 'PF_SCREEN_DISABLE'];
   const saved = {};
   for (const k of ENV_KEYS) saved[k] = process.env[k];
   t.after(() => {
@@ -85,6 +85,11 @@ active_provider: mock-a
   });
   process.env.UPB_CONFIG = join(dir, 'routes.yaml');
   process.env.USAGE_LOG = join(dir, 'usage.jsonl');
+  // This test exercises cooldown failover, not privacy screening. The pf-screen
+  // daemon is not guaranteed in every test environment (no /run/pf-screen.sock on
+  // workstations), and fail-closed screening would 503 before the upstream 429
+  // can surface. Must be set BEFORE the router import (read at module load).
+  process.env.PF_SCREEN_DISABLE = '1';
   delete process.env.UPB_PROVIDER;
   delete process.env.UPB_BASE_URL;
 
