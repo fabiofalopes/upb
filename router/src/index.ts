@@ -20,6 +20,7 @@ import { getAdapter, listAdapters } from './adapters/registry.js';
 import { classifyError, shouldRetry, getRetryDelay, ErrorCategory } from './utils/errors.js';
 import { logUsage, extractUsage, extractUsageFromSSE, computeCostUsd, aggregateUsage } from './utils/usage-logger.js';
 import { CooldownRegistry, DEFAULT_COOLDOWN_SECONDS, ProviderQuarantinedError } from './utils/cooldown.js';
+import { acquireSlot, QueueTimeoutError, laneStatus } from './middleware/queue.js';
 import { mergeProviderHeaders } from './utils/headers.js';
 import type { AnthropicRequest } from './types/anthropic.js';
 import type { ProviderAdapter } from './adapters/types.js';
@@ -210,6 +211,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       version: routerCfg.version,
       providers: Object.keys(routerCfg.providers),
       active_provider: routerCfg.active_provider,
+      lanes: laneStatus(),
       cooldowns: cooldown.snapshot(),
       uptime: process.uptime(),
     }));
@@ -280,6 +282,22 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   res.end(JSON.stringify({ type: 'error', error: { type: 'not_found', message: `Not found: ${req.method} ${req.url}` } }));
 }
 
+// Concurrency gate helper — acquire a provider slot or fail the response cleanly.
+async function acquireSlotChecked(resolved: ResolvedProvider, res: http.ServerResponse): Promise<{ release(): void }> {
+  try {
+    return await acquireSlot(resolved.name, resolved.definition.max_parallel);
+  } catch (err) {
+    if (err instanceof QueueTimeoutError) {
+      res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '30' });
+      res.end(JSON.stringify({ error: { message: (err as Error).message, type: 'overloaded_error' } }));
+    } else {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `queue error: ${(err as Error).message}`, type: 'api_error' } }));
+    }
+    return { release() {} };
+  }
+}
+
 // ── OpenAI Intake Handler (for OpenCode, Hermes) ──
 
 async function handleOpenAIRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -334,7 +352,10 @@ async function handleOpenAIRequest(req: http.IncomingMessage, res: http.ServerRe
   };
 
   // Forward with retry
-  await forwardToProvider(providerUrl, outboundHeaders, outboundBody, isStream, res, resolved, model);
+  const slot = await acquireSlotChecked(resolved, res);
+  try {
+    await forwardToProvider(providerUrl, outboundHeaders, outboundBody, isStream, res, resolved, model);
+  } finally { slot.release(); }
 }
 
 // ── Anthropic Intake Handler (for Claude Code) ──
@@ -500,7 +521,10 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
     }
   } else {
     // Non-streaming
-    await forwardToProvider(providerUrl, outboundHeaders, openaiRequest, false, res, resolved, body.model, true);
+    const slot = await acquireSlotChecked(resolved, res);
+    try {
+      await forwardToProvider(providerUrl, outboundHeaders, openaiRequest, false, res, resolved, body.model, true);
+    } finally { slot.release(); }
   }
 }
 
