@@ -27,6 +27,9 @@ export interface ProviderDefinition {
   model_map?: Record<string, string>;
   model_prefix?: string;
   models?: Record<string, ModelDefinition>;
+  catalog?: 'live' | 'static';   // static is the deprecated opt-out; live mirrors /models
+  models_url?: string;          // listing endpoint when it differs from base_url
+  catalog_ttl_s?: number;       // cache TTL for the upstream /models mirror
   timeout: number;
   strip_thinking?: boolean;
   strip_cache_control?: boolean;
@@ -150,6 +153,29 @@ function buildFromEnv(): RouterConfig {
   if (modelMapStr) {
     try {
       provider.model_map = JSON.parse(modelMapStr);
+    } catch { /* ignore */ }
+  }
+
+  // Live-catalog mirror policy (set by `upb run` for catalog: live providers):
+  // TTL seconds for the upstream /models cache (0 = always fetch fresh) and an
+  // optional listing URL when it differs from the serving base_url.
+  if (process.env.UPB_CATALOG_TTL !== undefined) {
+    const ttl = parseInt(process.env.UPB_CATALOG_TTL, 10);
+    if (!Number.isNaN(ttl)) {
+      provider.catalog = 'live';
+      provider.catalog_ttl_s = ttl;
+    }
+  }
+  if (process.env.UPB_MODELS_URL) provider.models_url = process.env.UPB_MODELS_URL;
+
+  // Pricing metadata for the pinned model(s) — never a validity list; models
+  // come from the live catalog. {modelId: {input_per_1m, output_per_1m}}.
+  const pricingStr = process.env.UPB_PRICING;
+  if (pricingStr) {
+    try {
+      const pricing = JSON.parse(pricingStr) as Record<string, ModelPricing>;
+      provider.models = Object.fromEntries(
+        Object.entries(pricing).map(([id, p]) => [id, { pricing: p }]));
     } catch { /* ignore */ }
   }
 

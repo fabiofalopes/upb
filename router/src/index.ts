@@ -21,6 +21,7 @@ import { classifyError, shouldRetry, getRetryDelay, ErrorCategory } from './util
 import { logUsage, extractUsage, extractUsageFromSSE, computeCostUsd, aggregateUsage } from './utils/usage-logger.js';
 import { CooldownRegistry, DEFAULT_COOLDOWN_SECONDS, ProviderQuarantinedError } from './utils/cooldown.js';
 import { mergeProviderHeaders } from './utils/headers.js';
+import { upstreamModels, mirrorEnabled } from './utils/upstream-catalog.js';
 import type { AnthropicRequest } from './types/anthropic.js';
 import type { ProviderAdapter } from './adapters/types.js';
 import type { ModelPricing } from './middleware/router-config.js';
@@ -239,34 +240,50 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
 
-  // ── GET /v1/models — List available models ──
+  // ── GET /v1/models — List available models (mirrors upstream /models) ──
   if (req.method === 'GET' && req.url === '/v1/models') {
     const models: Array<{ id: string; object: string; created: number; owned_by: string }> = [];
     const now = Math.floor(Date.now() / 1000);
-
-    for (const [name, def] of Object.entries(routerCfg.providers)) {
-      if (def.enabled === false) continue;
-      // List the ids a client can actually send: provider-namespaced model ids
-      // (prefix-routed), claude-* wire names (model_map-routed), and the BARE
-      // LANE ALIAS (model_map key === provider name) — the short id we type:
-      //   upb run <mac-big>/glm53flash   instead of
-      //   upb run <mac-big>/glm53flash/GLM-5.3-Flash-GGUF
-      const push = (id: string) => {
-        if (id && !models.find(m => m.id === id)) {
-          models.push({ id, object: 'model', created: now, owned_by: name });
-        }
-      };
-      for (const modelId of Object.keys(def.models || {})) {
-        push(`${name}/${modelId}`);
+    const push = (id: string, owner: string) => {
+      if (id && !models.find(m => m.id === id)) {
+        models.push({ id, object: 'model', created: now, owned_by: owner });
       }
+    };
+
+    // The invariant: what a provider serves is what its /models says. Mirror
+    // each live-catalog provider's upstream listing; a retired model
+    // disappears as soon as the TTL lapses (or immediately for ttl=0 lanes).
+    const entries = await Promise.all(Object.entries(routerCfg.providers)
+      .filter(([, def]) => def.enabled !== false)
+      .map(async ([name, def]) => {
+        if (!mirrorEnabled(def)) return { name, def, upstream: null };
+        const ttl = def.catalog_ttl_s ?? 300;
+        const upstream = await upstreamModels(name, def, ttl);
+        return { name, def, upstream };
+      }));
+
+    for (const { name, def, upstream } of entries) {
+      if (upstream) {
+        // Upstream ids, verbatim AND provider-namespaced — both are sendable
+        // (prefix routing accepts `name/id`; single-provider env mode takes `id`).
+        for (const m of upstream) {
+          push(m.id, name);
+          push(`${name}/${m.id}`, name);
+        }
+      } else {
+        // static opt-out, or upstream unreachable with no cache: fall back to
+        // the configured list so the endpoint still answers.
+        for (const modelId of Object.keys(def.models || {})) {
+          push(`${name}/${modelId}`, name);
+        }
+      }
+      // Wire names the proxy actually maps (claude-*, bare lane aliases):
+      // advertising an unmapped wire name would resolve to the active
+      // provider and 404, so only mapped keys are listed.
       for (const key of Object.keys(def.model_map || {})) {
-        if (key.startsWith(`${name}/`) || key.startsWith('claude-') || key === name) push(key);
+        if (key.startsWith(`${name}/`) || key.startsWith('claude-') || key === name) push(key, name);
       }
     }
-
-    // Claude Code wire names are advertised only when a provider actually maps
-    // them (the loop above already lists model_map keys) — advertising an
-    // unmapped wire name would resolve to the active provider and 404.
 
     res.writeHead(200, {
       'Content-Type': 'application/json',

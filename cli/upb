@@ -7,10 +7,11 @@
 #
 # Usage:
 #   upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
-#   upb models PROVIDER [--refresh] [--json]
-#                                   models of a provider (live fetch for catalog: live)
+#   upb models PROVIDER [--refresh] [--all] [--json]
+#                                   live /models listing (the invariant: always)
 #   upb verify [PROVIDER] [--probe] [--json]
-#                                   audit declared models vs live catalogs
+#                                   audit pins (default_model, role keys,
+#                                   claude_env) vs the live /models catalogs
 #                                   (--probe: 1-token entitlement check, billable)
 #   upb status [--json]             key resolution + live endpoint health
 #   upb run ROUTE [-- ARGS...]      launch claude through a route
@@ -19,10 +20,14 @@
 #   upb default                     show the default route
 #   upb doctor                      config, keys, ports, binaries, hygiene
 #
-# Providers with `catalog: live` discover models from /v1/models at runtime;
-# any listed model can be run on demand (upb run provider/<model-id>). A live
-# provider MAY be the default if it declares `default_model: <id>` — otherwise
-# it stays an explicit-run surface (usage-metered providers should not declare it).
+# Model truth (invariant): every provider's valid model list IS its live
+# /models endpoint — discovered at runtime, validated at run time, never
+# hand-maintained. `catalog: static` is a deprecated opt-out for endpoints
+# without a listing. A live provider MAY be the default if it declares
+# `default_model: <id>` — otherwise it stays an explicit-run surface
+# (usage-metered providers should not declare it). Wire pins (ANTHROPIC_*)
+# derive from the route model; role keys (opus_model/sonnet_model/
+# haiku_model) or explicit claude_env entries override.
 #
 # Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify findings
 #             · 4 spawn failed
@@ -31,10 +36,11 @@ HELP_TEXT = """upb — route control for Claude Code over the Universal Provider
 
 Usage:
   upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
-  upb models PROVIDER [--refresh] [--json]
-                                  models of a provider (live fetch for catalog: live)
+  upb models PROVIDER [--refresh] [--all] [--json]
+                                  live /models listing (the invariant: always)
   upb verify [PROVIDER] [--probe] [--json]
-                                  audit declared models vs live catalogs
+                                  audit pins (default_model, role keys,
+                                  claude_env) vs the live /models catalogs
   upb status [--json]             key resolution + live endpoint health
   upb run ROUTE [-- ARGS...]      launch claude through a route
                                   ROUTE = default | provider | provider/model
@@ -42,10 +48,14 @@ Usage:
   upb default                     show the default route
   upb doctor                      config, keys, ports, binaries, hygiene
 
-Providers with `catalog: live` discover models from /v1/models at runtime;
-any listed model can be run on demand (upb run provider/<model-id>). A live
-provider MAY be the default if it declares `default_model: <id>` — otherwise
-it stays an explicit-run surface (usage-metered providers should not declare it).
+Model truth (invariant): every provider's valid model list IS its live
+/models endpoint — discovered at runtime, validated at run time, never
+hand-maintained. `catalog: static` is a deprecated opt-out for endpoints
+without a listing. A live provider MAY be the default if it declares
+`default_model: <id>` — otherwise it stays an explicit-run surface
+(usage-metered providers should not declare it). Wire pins (ANTHROPIC_*)
+derive from the route model; role keys (opus_model/sonnet_model/
+haiku_model) or explicit claude_env entries override.
 
 Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify findings
             · 4 spawn failed"""
@@ -75,7 +85,7 @@ SECRETS_PATH = Path(os.environ.get("UPB_SECRETS", "~/.config/upb/secrets.env")).
 SESSION_BINDING = Path(os.environ.get("UPB_SESSION_BINDING", "~/.config/upb/session-binding.env")).expanduser()
 ROUTER_ENV = Path(os.environ.get("UPB_ROUTER_ENV", "~/.config/upb/router.env")).expanduser()
 PORT_RANGE = (9000, 9200)          # dynamic ports for live-catalog routes
-CATALOG_TTL_S = 3600
+CATALOG_TTL_S = 300                # remote catalogs: models rotate; re-ask often
 
 
 def _load_secrets():
@@ -201,7 +211,19 @@ def resolve_key(spec):
 
 
 def is_catalog(prov):
-    return prov.get("catalog") == "live"
+    """Live catalog is the DEFAULT: a provider's valid model list is whatever
+    its /models endpoint reports. `catalog: static` is a deprecated opt-out
+    for endpoints that serve no listing (they hand-maintain `models:`).
+
+    Anthropic-native endpoints don't speak OpenAI /models — they are live
+    only when `models_base_url` points at a real listing (e.g. z.ai paas/v4);
+    otherwise they stay static (their `models:` is the list, pins allowed)."""
+    c = prov.get("catalog")
+    if c is not None:
+        return c != "static"
+    if prov.get("kind") == "anthropic-native":
+        return bool(prov.get("models_base_url"))
+    return True
 
 
 def sorted_providers(cfg):
@@ -289,8 +311,9 @@ def catalog_ttl(prov):
     Tailnet-local endpoints are free, fast and change whenever a lane is
     swapped — always ask them. (Hit live 2026-10-05: a retired lane stayed
     listed for an hour because of the default TTL.) Remote catalogs are
-    rate-limited and change rarely, so they keep the long TTL. An explicit
-    `catalog_ttl` on the provider overrides both.
+    rate-limited but still rotate (free tiers especially), so they keep the
+    short CATALOG_TTL_S. An explicit `catalog_ttl` on the provider overrides
+    both.
     """
     if "catalog_ttl" in prov:
         return prov["catalog_ttl"]
@@ -299,7 +322,47 @@ def catalog_ttl(prov):
     return CATALOG_TTL_S
 
 
-def get_catalog_entries(pname, prov, refresh=False, cache=True):
+class CatalogError(RuntimeError):
+    pass
+
+
+def fetch_catalog(pname, prov, write=True):
+    """Live GET <models_base_url|base_url>/models → entries. Raises CatalogError
+    on failure; writes the cache on success (unless write=False). This is the
+    single path that establishes model truth. write=False keeps one-off full
+    fetches (e.g. the discover:loaded cold check) from polluting the
+    filtered-set cache."""
+    key, desc = resolve_key(prov.get("key"))
+    if key is None:
+        raise CatalogError(f"key unavailable for {pname}: {desc}")
+    url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={"User-Agent": "upb/1.0"})
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        raise CatalogError(f"catalog fetch failed for {pname}: {e}")
+    entries = [m for m in data.get("data", []) if m.get("id")]
+    if prov.get("discover") == "loaded":
+        # endpoints like unsloth studio mix prepared-but-cold models into
+        # /v1/models — only entries flagged `loaded` can actually serve right
+        # now. List (and run) exactly those; --all in `upb models` sees the rest.
+        entries = [m for m in entries if m.get("loaded")]
+    if not entries:
+        raise CatalogError(f"catalog empty for {pname}")
+    if write:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / f"catalog-{pname}.json").write_text(
+            json.dumps({"fetched_at": time.time(), "entries": entries}))
+    return entries
+
+
+def get_catalog_entries(pname, prov, refresh=False, cache=True, stale_fallback=False):
+    """TTL-cached listing (cache=False → no cache read/write, e.g. a filtered
+    one-off). stale_fallback=True: on fetch failure return the cache of any age
+    instead of raising — for run-time validation when /models is briefly down."""
     if not refresh:
         # hot-swap lanes (unsloth studio) change their loaded set on every lane
         # swap — a long TTL would serve stale "loaded" models. Local endpoints
@@ -310,35 +373,28 @@ def get_catalog_entries(pname, prov, refresh=False, cache=True):
             hit = cached_catalog(pname, ttl=ttl)
             if hit:
                 return hit
-    key, desc = resolve_key(prov.get("key"))
-    if key is None:
-        die(f"key unavailable for {pname}: {desc}", 3)
-    url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
-    req = urllib.request.Request(url, headers={"User-Agent": "upb/1.0"})
-    if key:
-        req.add_header("Authorization", f"Bearer {key}")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        die(f"catalog fetch failed for {pname}: {e}", 3)
-    entries = [m for m in data.get("data", []) if m.get("id")]
-    if prov.get("discover") == "loaded":
-        # endpoints like unsloth studio mix prepared-but-cold models into
-        # /v1/models — only entries flagged `loaded` can actually serve right
-        # now. List (and run) exactly those; --all in `upb models` sees the rest.
-        entries = [m for m in entries if m.get("loaded")]
-    if not entries:
-        die(f"catalog empty for {pname}", 3)
-    if cache:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (CACHE_DIR / f"catalog-{pname}.json").write_text(
-            json.dumps({"fetched_at": time.time(), "entries": entries}))
-    return entries
+        return fetch_catalog(pname, prov, write=cache)
+    except CatalogError:
+        if not stale_fallback:
+            raise
+        stale = cached_catalog(pname, ttl=float("inf"))
+        if stale is None:
+            raise
+        print(f"upb: warning: {pname} /models unreachable — using stale cache "
+              f"({len(stale)} ids)", file=sys.stderr)
+        return stale
 
 
 def get_catalog(pname, prov, refresh=False, cache=True):
     return [m["id"] for m in get_catalog_entries(pname, prov, refresh, cache)]
+
+
+def live_catalog_ids(pname, prov):
+    """Authoritative id set for run-time validation: always hits /models
+    (bypassing the TTL), falls back to the stale cache with a warning."""
+    return [m["id"] for m in get_catalog_entries(
+        pname, prov, refresh=True, stale_fallback=True)]
 
 
 def lane_rows(entries):
@@ -369,15 +425,34 @@ def resolve_route_arg(cfg, arg):
     """arg = 'default' | 'provider' | 'provider/model'. Returns route dict or None."""
     routes = list(iter_routes(cfg))
     if arg in (None, "", "default"):
-        return next((r for r in routes if r["eligible"]), None)
+        # The default route is validated live too: a default_model the
+        # provider no longer serves is skipped in favor of the next eligible
+        # route (same /models truth as explicit runs). Unreachable /models with
+        # no cache → accept, the run surfaces it.
+        for r in routes:
+            if not r["eligible"]:
+                continue
+            if not r["dynamic"]:
+                return r
+            try:
+                if r["model"] in live_catalog_ids(r["provider"],
+                                                  cfg["providers"][r["provider"]]):
+                    return r
+                print(f"upb: note: default {r['provider']}/{r['model']} not in "
+                      "live catalog — trying next route", file=sys.stderr)
+            except CatalogError:
+                return r
+        return None
     pname, _, model = arg.partition("/")
     prov = cfg["providers"].get(pname)
-    # live-catalog provider: any model from the (cached) catalog is runnable;
-    # a declared default_model is accepted without a catalog hit (cache may be
-    # cold or upstream /models may briefly lack it — the run itself will error)
+    # Live-catalog provider (the default): the model — including a declared
+    # default_model — is validated against the LIVE /models endpoint at run
+    # time, never against config lists. Stale cache is an acceptable fallback
+    # only when /models is briefly unreachable (live_catalog_ids).
     if prov and is_catalog(prov):
         issues = provider_issues(prov)
         dm = prov.get("default_model")
+        explicit = bool(model)
         if not model:
             model = dm or ""
         if model:
@@ -390,9 +465,21 @@ def resolve_route_arg(cfg, arg):
                 "active_until": str(prov.get("active_until", "")),
                 "is_default": False, "dynamic": True,
             }
-            if issues or model == dm:
+            if issues:
                 return route
-            if model in get_catalog(pname, prov):
+            try:
+                ids = live_catalog_ids(pname, prov)
+            except CatalogError:
+                # /models unreachable AND no cache. A bare `provider` arg
+                # (resolves to default_model) still launches — the request
+                # itself surfaces the real error. An explicit provider/model
+                # we cannot validate is refused (raise → cmd_run dies).
+                if not explicit:
+                    print(f"upb: warning: {pname} catalog unreachable — trusting "
+                          f"default_model {model}", file=sys.stderr)
+                    return route
+                raise
+            if model in ids:
                 return route
             # discover: loaded lanes hot-swap; a prepared-but-cold model is still
             # runnable — the endpoint loads it on demand (~1 min first hit).
@@ -400,7 +487,7 @@ def resolve_route_arg(cfg, arg):
                     pname, dict(prov, discover=None), refresh=True, cache=False):
                 return route
         return None
-    # static routes
+    # static (catalog: static) — deprecated opt-out
     if model:
         match = [r for r in routes if r["provider"] == pname and r["model"] == model]
         return match[0] if match else None
@@ -509,6 +596,17 @@ def ensure_proxy(cfg, prov, model, port, key_value):
     env["UPB_MODEL_MAP"] = json.dumps({w: model for w in WIRE_NAMES})
     env["PORT"] = str(port)
     env["LOCAL_SECRET"] = prov.get("local_secret", "upb-local")
+    # Live-catalog passthrough: the proxy's own GET /v1/models mirrors upstream
+    # (same TTL rules as the CLI: tailnet-local always, remote short).
+    if is_catalog(prov):
+        env["UPB_CATALOG_TTL"] = str(catalog_ttl(prov))
+        if prov.get("models_base_url"):
+            env["UPB_MODELS_URL"] = prov["models_base_url"]
+    # Pricing is metadata (never a validity list) — forwarded so cost_usd works
+    # for dynamic routes the proxy never saw declared.
+    pricing = model_pricing(prov, model)
+    if pricing:
+        env["UPB_PRICING"] = json.dumps({model: pricing})
     print(f"[upb] starting proxy on :{port} ({model})...", file=sys.stderr)
     with open(log_file, "w") as log:
         proc = subprocess.Popen([node_binary(cfg), str(entry)],
@@ -546,11 +644,23 @@ def build_launch_env(cfg, prov, route, token, base_url):
     # over ambient env and over a stale session-binding.env (the claude
     # wrapper reloads it), which previously leaked the last route's model
     # into the new proxy (e.g. glm-5.2 sent to a zen/free route → 401).
+    # Wire pins derive from the live route model (role keys override per tier):
+    #   opus_model / sonnet_model / haiku_model on the provider pick the
+    #   expensive/mid/cheap tiers; everything else follows route["model"].
+    # An explicit claude_env entry always wins (deliberate pin), and
+    # route_pin_issues() checks pins against the live catalog at run time.
     prov_env = prov.get("claude_env") or {}
-    if "ANTHROPIC_MODEL" not in prov_env:
-        env["ANTHROPIC_MODEL"] = route["model"]
-    if "CLAUDE_CODE_SUBAGENT_MODEL" not in prov_env:
-        env["CLAUDE_CODE_SUBAGENT_MODEL"] = route["model"]
+    rm = route["model"]
+    pins = {
+        "ANTHROPIC_MODEL": rm,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": prov.get("opus_model", rm),
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": prov.get("sonnet_model", rm),
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": prov.get("haiku_model", rm),
+        "CLAUDE_CODE_SUBAGENT_MODEL": prov.get("haiku_model", rm),
+    }
+    for k, v in pins.items():
+        if k not in prov_env:
+            env[k] = v
     return env
 
 
@@ -648,9 +758,9 @@ def cmd_list(cfg, args):
         print(f"\u2605 default:  {fmt_route_name(default)}  ({default['trust_zone']})")
     print()
 
-    # ── pinned / static routes ──
+    # ── default routes (live providers with default_model) / static opt-out ──
     if visible:
-        print(f"Pinned routes ({len(visible)})")
+        print(f"Default/pinned routes ({len(visible)})")
         for r in visible:
             star = "\u2605 " if r.get("is_default") else "  "
             name = fmt_route_name(r)
@@ -711,6 +821,9 @@ def cmd_models(cfg, args):
     if not prov:
         die(f"unknown provider '{args.provider}'", 3)
     if not is_catalog(prov):
+        print(f"upb: note: {args.provider} uses the deprecated `catalog: static` "
+              "opt-out — listing hand-maintained models, not the live /models",
+              file=sys.stderr)
         models = list((prov.get("models") or {}).keys())
         if args.json:
             print(json.dumps({"provider": args.provider, "count": len(models),
@@ -756,9 +869,9 @@ def cmd_status(cfg, args):
     def probe(pname):
         prov = provs[pname]
         key, desc = resolve_key(prov.get("key"))
-        url = prov["base_url"].rstrip("/") + "/models"
-        if prov.get("kind") == "anthropic-native":
-            url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
+        # /models is the model-truth endpoint — probe it (honoring
+        # models_base_url for endpoints whose listing lives elsewhere).
+        url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
         state, detail = http_probe(url, key or None)
         return pname, key is not None, desc, state, detail
 
@@ -803,6 +916,62 @@ def cmd_status(cfg, args):
     return 0
 
 
+def model_pricing(prov, model):
+    """Pricing metadata for a model id (models: is metadata-only under the
+    live-catalog default; used for cost_usd, never for validity)."""
+    return ((prov.get("models") or {}).get(model) or {}).get("pricing")
+
+
+PIN_ENV_KEYS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL")
+
+
+def pin_matches_catalog(pin, ids):
+    """Does a wire-pin value name a model the catalog serves?
+
+    Tolerates Claude Code syntax: provider namespaces (zen/big-pickle) and
+    capability modifiers (deepseek-v4-pro[1m])."""
+    import re
+    base = re.sub(r"\[[^\]]*\]", "", str(pin))     # strip [1m], [chrome], …
+    bare = base.split("/")[-1]
+    return base in ids or bare in ids
+
+
+def route_pin_issues(cfg, route):
+    """Wire pins that contradict the live catalog.
+
+    Validates the EFFECTIVE pin set — every ANTHROPIC_* value the launch will
+    carry: claude_env entries, plus derived role keys (opus/sonnet/haiku_model)
+    for live providers — against the provider's live /models (or, for the
+    deprecated static opt-out, the declared `models:` keys). Empty when all
+    pins serve. Raises CatalogError only if /models is unreachable AND no
+    cache exists."""
+    pname = route["provider"]
+    prov = cfg["providers"][pname]
+    live = is_catalog(prov)
+    claude_env = {k: v for k, v in (prov.get("claude_env") or {}).items()
+                  if k in PIN_ENV_KEYS}
+    if live:
+        rm = route["model"]
+        derived = {
+            "ANTHROPIC_MODEL": rm,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": prov.get("opus_model", rm),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": prov.get("sonnet_model", rm),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": prov.get("haiku_model", rm),
+            "CLAUDE_CODE_SUBAGENT_MODEL": prov.get("haiku_model", rm),
+        }
+        pins = {**derived, **claude_env}   # explicit claude_env wins (as in build_launch_env)
+    else:
+        pins = claude_env
+    if not pins:
+        return []
+    ids = set(live_catalog_ids(pname, prov)) if live \
+        else set((prov.get("models") or {}).keys())
+    return [{"key": k, "value": v} for k, v in pins.items()
+            if v is not None and not pin_matches_catalog(v, ids)]
+
+
 def cmd_run(cfg, args):
     route = resolve_route_arg(cfg, args.route)
     if route is None:
@@ -820,6 +989,18 @@ def cmd_run(cfg, args):
         die(f"route '{fmt_route_name(route)}' not usable: {'; '.join(route['issues'])}", 3)
 
     prov = cfg["providers"][route["provider"]]
+    # Static claude_env pins must agree with the live catalog — a pin to a
+    # retired model id silently overrides the route model and 404s upstream.
+    try:
+        bad = route_pin_issues(cfg, route)
+    except CatalogError as e:
+        print(f"upb: warning: cannot validate pins — {e}", file=sys.stderr)
+        bad = []
+    if bad:
+        die("static wire pins contradict the live catalog: "
+            + "; ".join(f"{b['key']}={b['value']}" for b in bad)
+            + f" — browse: upb models {route['provider']} "
+            "(remove the pins and let wire names derive from the route model)", 3)
     key_value, key_desc = resolve_key(prov.get("key"))
 
     if route["kind"] == "upb":
@@ -1011,11 +1192,11 @@ def _verify_headers(prov, key):
 
 
 def _list_provider_models(prov):
-    """GET {base_url}/models for a kind:upb provider. Returns (model_ids, error)."""
+    """GET {models_base_url|base_url}/models. Returns (model_ids, error)."""
     key, desc = resolve_key(prov.get("key"))
     if key is None:
         return None, f"key unavailable ({desc})"
-    url = prov["base_url"].rstrip("/") + "/models"
+    url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
     req = urllib.request.Request(url, headers=_verify_headers(prov, key))
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1032,9 +1213,12 @@ def _list_provider_models(prov):
 
 
 def _probe_model(prov, model):
-    """POST a 1-token chat completion. Returns HTTP status int (-1 = transport error)."""
+    """POST a 1-token chat completion. Returns HTTP status int (-1 = transport error).
+
+    Honors models_base_url: for anthropic-native providers the OpenAI
+    chat/completions surface lives there (the serving base speaks Messages)."""
     key, _ = resolve_key(prov.get("key"))
-    url = prov["base_url"].rstrip("/") + "/chat/completions"
+    url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/chat/completions"
     body = json.dumps({"model": model,
                        "messages": [{"role": "user", "content": "hi"}],
                        "max_tokens": 1}).encode()
@@ -1066,24 +1250,51 @@ def cmd_verify(cfg, args):
 
     def check(pname):
         prov = provs[pname]
-        if prov.get("kind") == "anthropic-native":
-            return {"skipped": "anthropic-native"}
         if not prov.get("base_url"):
             return {"error": "no base_url"}
-        declared = list((prov.get("models") or {}).keys())
+        live = is_catalog(prov)
+        if prov.get("kind") == "anthropic-native":
+            # Native endpoints have no OpenAI /v1/models at their serving base —
+            # unless models_base_url points at one (e.g. zai paas/v4). Live
+            # providers WITH a listing are auditable; the rest skip.
+            if not (live and prov.get("models_base_url")):
+                return {"skipped": "anthropic-native, no models_base_url"}
         ids, err = _list_provider_models(prov)
         if err:
             return {"error": err}
+        idset = set(ids)
         res = {}
-        missing = [m for m in declared if m not in set(ids)]
-        new = [m for m in ids if m not in set(declared)]
-        if missing:
-            res["missing_upstream"] = missing
-        if new:
-            res["new_upstream"] = new
-        res["ok"] = len(declared) - len(missing)
-        if args.probe and declared:
-            res["probe"] = {m: _probe_model(prov, m) for m in declared}
+        if live:
+            # Live-by-default: nothing is declared — audit the PINS instead.
+            # Any pinned id (default_model, role keys, claude_env wire pins)
+            # that the live catalog no longer serves is the critical finding.
+            pins = []
+            for k in ("default_model", "opus_model", "sonnet_model", "haiku_model"):
+                if prov.get(k):
+                    pins.append((k, prov[k]))
+            for k, v in (prov.get("claude_env") or {}).items():
+                if k in PIN_ENV_KEYS:
+                    pins.append((k, v))
+            stale = [{"pin": k, "value": v} for k, v in pins
+                     if not pin_matches_catalog(v, idset)]
+            if stale:
+                res["stale_pins"] = stale
+            res["catalog"] = len(idset)
+            res["ok"] = len(pins) - len(stale)
+            targets = [v for _, v in pins]
+        else:
+            # Deprecated static opt-out: diff declared models vs the listing.
+            declared = list((prov.get("models") or {}).keys())
+            missing = [m for m in declared if m not in idset]
+            new = [m for m in ids if m not in set(declared)]
+            if missing:
+                res["missing_upstream"] = missing
+            if new:
+                res["new_upstream"] = new
+            res["ok"] = len(declared) - len(missing)
+            targets = declared
+        if args.probe and targets:
+            res["probe"] = {m: _probe_model(prov, m) for m in targets}
         return res
 
     results = {}
@@ -1091,7 +1302,8 @@ def cmd_verify(cfg, args):
         for pname, res in ex.map(lambda p: (p, check(p)), list(provs)):
             results[pname] = res
 
-    missing_total = sum(len(r.get("missing_upstream") or []) for r in results.values())
+    missing_total = (sum(len(r.get("missing_upstream") or []) for r in results.values())
+                     + sum(len(r.get("stale_pins") or []) for r in results.values()))
     error_count = sum(1 for r in results.values() if "error" in r)
     checked = sum(1 for r in results.values() if "error" not in r and "skipped" not in r)
     probe_bad = sum(1 for r in results.values()
@@ -1107,7 +1319,13 @@ def cmd_verify(cfg, args):
             elif "error" in res:
                 print(f"  listing error: {res['error']}")
             else:
-                print(f"  ok: {res['ok']} matched")
+                if "catalog" in res:
+                    print(f"  catalog: {res['catalog']} live models · "
+                          f"ok: {res['ok']} pins valid")
+                else:
+                    print(f"  ok: {res['ok']} matched")
+                for p in res.get("stale_pins") or []:
+                    print(f"  ✗ stale pin: {p['pin']}={p['value']} (not in live catalog)")
                 for m in res.get("missing_upstream") or []:
                     print(f"  ✗ missing upstream: {m}")
                 for m in res.get("new_upstream") or []:
@@ -1115,8 +1333,8 @@ def cmd_verify(cfg, args):
                 for m, st in (res.get("probe") or {}).items():
                     st_txt = str(st) if st >= 0 else "transport error"
                     print(f"  probe {m} -> {st_txt}")
-        print(f"\n{checked} providers checked, {missing_total} missing upstream, "
-              f"{error_count} errors")
+        print(f"\n{checked} providers checked, {missing_total} findings "
+              f"(stale pins / missing upstream), {error_count} errors")
 
     return 3 if (missing_total or error_count or probe_bad) else 0
 
@@ -1320,19 +1538,24 @@ def main():
                           help="include prepared-but-cold models on discover: loaded lanes")
     p_models.add_argument("--json", action="store_true")
     p_verify = sub.add_parser(
-        "verify", help="audit declared models against providers' live catalogs",
-        description=("Audit models declared in routes.yaml against each provider's "
-                     "live /models catalog (kind: upb providers; anthropic-native "
-                     "providers are skipped — their endpoints don't serve OpenAI "
-                     "/v1/models). Reports declared models missing upstream (stale "
-                     "ids — the critical finding), new upstream models "
-                     "(informational), and match counts. With --probe, also POSTs "
-                     "a 1-token chat completion per declared model: the "
-                     "authoritative entitlement check, since listing can include "
-                     "unentitled models. Note: --probe makes real (tiny, ~1-token) "
-                     "billable calls on metered models. "
+        "verify", help="audit model pins against providers' live /models catalogs",
+        description=("Audit each provider's live /models catalog. For live "
+                     "providers (the default) the critical finding is a STALE "
+                     "PIN: default_model / opus_model / sonnet_model / "
+                     "haiku_model / claude_env wire pins naming an id the "
+                     "catalog no longer serves. For deprecated `catalog: "
+                     "static` providers it diffs declared models vs the "
+                     "listing instead (missing upstream = stale ids, new "
+                     "upstream = informational). Anthropic-native providers "
+                     "without models_base_url are skipped (no OpenAI listing). "
+                     "With --probe, also POSTs a 1-token chat completion per "
+                     "pinned/declared model: the authoritative entitlement "
+                     "check, since listing can include unentitled models. "
+                     "Note: --probe makes real (tiny, ~1-token) billable calls "
+                     "on metered models. "
                      "Exit codes: 0 clean · 2 usage/config error · 3 findings "
-                     "(missing upstream, listing error, or probe non-200)."))
+                     "(stale pins, missing upstream, listing error, or probe "
+                     "non-200)."))
     p_verify.add_argument("provider", nargs="?",
                           help="verify only this provider (default: all enabled "
                                "providers with a base_url)")
@@ -1368,7 +1591,12 @@ def main():
         args.json = False
     if cmd == "run" and args.claude_args and args.claude_args[0] == "--":
         args.claude_args = args.claude_args[1:]
-    return handlers[cmd](cfg, args)
+    try:
+        return handlers[cmd](cfg, args)
+    except CatalogError as e:
+        # /models unreachable with no cache — the invariant cannot be checked
+        # and there is nothing to fall back to. Clean exit, not a traceback.
+        die(str(e), 3)
 
 
 if __name__ == "__main__":
