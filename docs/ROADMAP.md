@@ -4,6 +4,40 @@
 > what has to get decided first*. The tactical backlog (claimable work items)
 > lives in `WORKLOG.md`; this file holds the gates and lanes that order it.
 
+## Consolidation checkpoint (2026-10-05)
+
+Where the project stands after the macs-lane integration, and what "near
+future" means now:
+
+**Mission, sharpened.** upb is the personal AI gateway: launcher + universal
+provider proxy that is trusted and *works*. From upb's perspective a provider
+is just an endpoint — third-party API, LAN box, or tailnet Mac running
+llama-server lanes. upb routes, discovers catalogs, and launches; it never
+cares what hardware or vendor sits behind the URL. The mac nodes are the proof:
+`<mac-big>` is "just another provider" with a live catalog, same as zai or alibaba.
+**Anthropic is explicitly out of scope as a paid provider** — a hard policy,
+not an oversight. Personal plans/subscriptions are the fuel upb maps and
+arbitrates.
+
+**State.** G0 closed (repo is the runtime home; `scripts/check-drift.sh`
+guards the invariant). Mac-lane fanout works end-to-end (sync-macs → router
+model_map → CLI lane aliases → collapsed `upb models` view). Remote push is
+the distribution channel — the repo on GitHub is the stable reference other
+machines pull from for larger-scale testing.
+
+**Near-future spec (priority order):**
+1. **Stability pass** — the lean/robust bar: no new surface until the current
+   surface (routing, failover, usage, verify, lane discovery) is boring.
+2. **Larger-scale testing** — more harnesses through one upb; watch usage +
+   cooldown behavior under real load.
+3. **Mac fleet as first-class providers** — sync-macs after lane swaps is
+   manual; the failure mode (stale model_map) should be visible in `doctor`.
+4. **Eval-before-route** (from the 2026-10 research pass) — per-lane eval
+   suites before routing a lane into rotation; extends `upb verify`.
+5. **Settings surface** — a panel/TUI is *wanted someday*, deliberately not
+   spec'd yet. The rule until then: everything configurable via routes.yaml +
+   CLI, nothing hidden.
+
 ## Decision gates
 
 A gate is a point where a choice must be made before dependent work can start.
@@ -11,7 +45,7 @@ Each has a trigger and a decision.
 
 | Gate | Trigger | Decision to make | Blocks |
 |------|---------|------------------|--------|
-| **G0 — repo↔live gap** | Now | Deploy repo → live, or keep the two intentionally separate? The live proxy runs from `~/shared-local/reports/claude-universal/`, not this repo. Editing the repo does not change the running Claude Code until deployed. | *everything* — a fix that doesn't reach the live system is theoretical |
+| **G0 — repo↔live gap** | **RESOLVED 2026-10** | The repo *is* the runtime: `~/bin/upb` symlinks here, `proxy.dir` points here, the old deployed copy is gone. `scripts/check-drift.sh` enforces all three. | ~~everything~~ — closed |
 | **G1 — provider collapse** | After G0; live upb proven healthy | Collapse OpenCode to a single `upb` provider (remove `alibaba-token-plan`, `opencode`, `opencode-go`, `litellm` from the auth store + json; remap `model` → `upb/…`; update `AGENTS.md` model policy). Only when live upb routes alibaba + litellm correctly. | monitoring payoff; single-spine topology |
 | **G2 — launcher split** | When the weekly Claude Code "saga" starts dragging the spine | Extract the "breaking Claude Code" concern into its own workspace, keep `upb run` embedded as a thin launcher. | clean separation of stable spine vs churning patch work |
 | **G3 — local-only spine** | When local models prove viable | Deploy one upb with only `litellm` models, cloud dropped. | the small-model harness experiment; full containment |
@@ -56,8 +90,8 @@ Concrete unresolved items (also tracked in `WORKLOG.md`):
 - **`claude` binary fragility** — an npm reinstall can skip postinstall,
   leaving `claude.exe` as a stub → `Exec format error`. Fix is manual
   (`node …/install.cjs`).
-- **repo↔live reconciliation** — repo `cli/upb` is ahead of live `~/bin/upb`
-  (`sync --full`, `find_router_service`, discovery). Decide direction (G0).
+- **repo↔live reconciliation** — resolved: repo is the runtime (G0, 2026-10);
+  drift is now checked by `scripts/check-drift.sh`.
 - **OpenCode model policy follows the remap?** — `AGENTS.md` pins
   `alibaba-token-plan/qwen3.8-max-preview` as the only allowed model. When the
   provider collapse happens, does the "only model" rule follow the `upb/…`
@@ -77,7 +111,8 @@ forget":
   layer to it (the single-spine payoff grows).
 - **When local models prove viable in a sandbox** → local-only deployment (G3).
 - **When a second user appears** → multi-user design (G4).
-- **When the repo diverges from live again** → re-check the G0 decision.
+- **When the repo diverges from live again** → `scripts/check-drift.sh` fails
+  first; fix the symlink/config, don't hand-edit live files.
 
 ## Operating note
 
