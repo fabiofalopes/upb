@@ -20,11 +20,35 @@
 #   upb doctor                      config, keys, ports, binaries, hygiene
 #
 # Providers with `catalog: live` discover models from /v1/models at runtime;
-# any listed model can be run on demand (upb run provider/<model-id>). They
-# are never the default route — usage-metered surfaces stay an explicit choice.
+# any listed model can be run on demand (upb run provider/<model-id>). A live
+# provider MAY be the default if it declares `default_model: <id>` — otherwise
+# it stays an explicit-run surface (usage-metered providers should not declare it).
 #
 # Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify findings
 #             · 4 spawn failed
+
+HELP_TEXT = """upb — route control for Claude Code over the Universal Provider Bridge.
+
+Usage:
+  upb [list] [--all] [--json]     eligible routes (default) / everything (--all)
+  upb models PROVIDER [--refresh] [--json]
+                                  models of a provider (live fetch for catalog: live)
+  upb verify [PROVIDER] [--probe] [--json]
+                                  audit declared models vs live catalogs
+  upb status [--json]             key resolution + live endpoint health
+  upb run ROUTE [-- ARGS...]      launch claude through a route
+                                  ROUTE = default | provider | provider/model
+  upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
+  upb default                     show the default route
+  upb doctor                      config, keys, ports, binaries, hygiene
+
+Providers with `catalog: live` discover models from /v1/models at runtime;
+any listed model can be run on demand (upb run provider/<model-id>). A live
+provider MAY be the default if it declares `default_model: <id>` — otherwise
+it stays an explicit-run surface (usage-metered providers should not declare it).
+
+Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify findings
+            · 4 spawn failed"""
 
 import argparse
 import json
@@ -49,6 +73,7 @@ CONFIG_PATH = Path(os.environ.get("UPB_ROUTES", "~/.config/upb/routes.yaml")).ex
 CACHE_DIR = Path(os.environ.get("UPB_CACHE", "~/.cache/upb")).expanduser()
 SECRETS_PATH = Path(os.environ.get("UPB_SECRETS", "~/.config/upb/secrets.env")).expanduser()
 SESSION_BINDING = Path(os.environ.get("UPB_SESSION_BINDING", "~/.config/upb/session-binding.env")).expanduser()
+ROUTER_ENV = Path(os.environ.get("UPB_ROUTER_ENV", "~/.config/upb/router.env")).expanduser()
 PORT_RANGE = (9000, 9200)          # dynamic ports for live-catalog routes
 CATALOG_TTL_S = 3600
 
@@ -199,33 +224,45 @@ def provider_issues(prov):
 
 
 def iter_routes(cfg):
-    """Yield static route dicts in preference order. Live-catalog providers
-    have no static models and are handled separately."""
+    """Yield route dicts in preference order. Static providers yield one route
+    per configured model. A live-catalog provider with `default_model` yields a
+    single dynamic route for that model (eligible as the overall default);
+    live providers without it are listed separately via catalog providers."""
     first_eligible_marked = False
+
+    def mk_route(pname, prov, model, issues, dynamic):
+        nonlocal first_eligible_marked
+        eligible = not issues
+        route = {
+            "provider": pname,
+            "label": prov.get("label", pname),
+            "model": model,
+            "port": None,
+            "kind": prov.get("kind", "upb"),
+            "trust_zone": prov.get("trust_zone", "unknown"),
+            "eligible": eligible,
+            "issues": issues,
+            "note": prov.get("note", ""),
+            "active_until": str(prov.get("active_until", "")),
+            "is_default": False,
+            "dynamic": dynamic,
+        }
+        if eligible and not first_eligible_marked:
+            route["is_default"] = True
+            first_eligible_marked = True
+        return route
+
     for pname, prov in sorted_providers(cfg):
-        if is_catalog(prov):
-            continue
         issues = provider_issues(prov)
+        if is_catalog(prov):
+            dm = prov.get("default_model")
+            if dm:
+                yield mk_route(pname, prov, dm, issues, True)
+            continue
         for model, mcfg in (prov.get("models") or {}).items():
             mcfg = mcfg or {}
-            eligible = not issues
-            route = {
-                "provider": pname,
-                "label": prov.get("label", pname),
-                "model": model,
-                "port": mcfg.get("port"),
-                "kind": prov.get("kind", "upb"),
-                "trust_zone": prov.get("trust_zone", "unknown"),
-                "eligible": eligible,
-                "issues": issues,
-                "note": prov.get("note", ""),
-                "active_until": str(prov.get("active_until", "")),
-                "is_default": False,
-                "dynamic": False,
-            }
-            if eligible and not first_eligible_marked:
-                route["is_default"] = True
-                first_eligible_marked = True
+            route = mk_route(pname, prov, model, issues, False)
+            route["port"] = (mcfg or {}).get("port")
             yield route
 
 
@@ -233,26 +270,32 @@ def fmt_route_name(r):
     return f"{r['provider']}/{r['model']}"
 
 
-def cached_catalog(pname):
+def cached_catalog(pname, ttl=CATALOG_TTL_S):
+    """Cached /v1/models entries (full dicts). Pre-entries cache files stored
+    bare id lists; they simply miss once and get rewritten."""
     f = CACHE_DIR / f"catalog-{pname}.json"
     try:
         d = json.loads(f.read_text())
-        if time.time() - d.get("fetched_at", 0) < CATALOG_TTL_S and d.get("models"):
-            return d["models"]
+        if time.time() - d.get("fetched_at", 0) < ttl and d.get("entries"):
+            return d["entries"]
     except (OSError, ValueError):
         pass
     return None
 
 
-def get_catalog(pname, prov, refresh=False):
+def get_catalog_entries(pname, prov, refresh=False, cache=True):
     if not refresh:
-        hit = cached_catalog(pname)
+        # hot-swap lanes (unsloth studio) change their loaded set on every lane
+        # swap — a long TTL would serve stale "loaded" models. 60s keeps run/
+        # list honest without hammering the endpoint.
+        hot = prov.get("discover") == "loaded"
+        hit = cached_catalog(pname, ttl=60 if hot else CATALOG_TTL_S)
         if hit:
             return hit
     key, desc = resolve_key(prov.get("key"))
     if key is None:
         die(f"key unavailable for {pname}: {desc}", 3)
-    url = prov["base_url"].rstrip("/") + "/models"
+    url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
     req = urllib.request.Request(url, headers={"User-Agent": "upb/1.0"})
     if key:
         req.add_header("Authorization", f"Bearer {key}")
@@ -261,13 +304,47 @@ def get_catalog(pname, prov, refresh=False):
             data = json.loads(resp.read())
     except Exception as e:
         die(f"catalog fetch failed for {pname}: {e}", 3)
-    models = [m.get("id") for m in data.get("data", []) if m.get("id")]
-    if not models:
+    entries = [m for m in data.get("data", []) if m.get("id")]
+    if prov.get("discover") == "loaded":
+        # endpoints like unsloth studio mix prepared-but-cold models into
+        # /v1/models — only entries flagged `loaded` can actually serve right
+        # now. List (and run) exactly those; --all in `upb models` sees the rest.
+        entries = [m for m in entries if m.get("loaded")]
+    if not entries:
         die(f"catalog empty for {pname}", 3)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    (CACHE_DIR / f"catalog-{pname}.json").write_text(
-        json.dumps({"fetched_at": time.time(), "models": models}))
-    return models
+    if cache:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / f"catalog-{pname}.json").write_text(
+            json.dumps({"fetched_at": time.time(), "entries": entries}))
+    return entries
+
+
+def get_catalog(pname, prov, refresh=False, cache=True):
+    return [m["id"] for m in get_catalog_entries(pname, prov, refresh, cache)]
+
+
+def lane_rows(entries):
+    """One display row per model, collapsing lane-fanout duplicates.
+
+    llama-server lanes behind a fanout router (upb-macs-router) list each
+    serving lane twice — bare 'lane' and 'lane/model-id' — with the same
+    owned_by. Collapse the pair into lane -> loaded model id. Unpaired ids
+    pass through untouched."""
+    by_id = {e["id"]: e for e in entries}
+    detail = {}
+    for e in entries:
+        lane, _, sub = e["id"].partition("/")
+        if sub and lane in by_id and by_id[lane].get("owned_by") == e.get("owned_by"):
+            detail[lane] = sub
+    rows, seen = [], set()
+    for e in entries:
+        i = e["id"]
+        key = i.partition("/")[0] if i.partition("/")[0] in detail else i
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((key, detail.get(key)))
+    return rows
 
 
 def resolve_route_arg(cfg, arg):
@@ -277,22 +354,33 @@ def resolve_route_arg(cfg, arg):
         return next((r for r in routes if r["eligible"]), None)
     pname, _, model = arg.partition("/")
     prov = cfg["providers"].get(pname)
-    # live-catalog provider: any model from the (cached) catalog is runnable
-    if prov and is_catalog(prov) and model:
+    # live-catalog provider: any model from the (cached) catalog is runnable;
+    # a declared default_model is accepted without a catalog hit (cache may be
+    # cold or upstream /models may briefly lack it — the run itself will error)
+    if prov and is_catalog(prov):
         issues = provider_issues(prov)
-        route = {
-            "provider": pname, "label": prov.get("label", pname), "model": model,
-            "port": None, "kind": prov.get("kind", "upb"),
-            "trust_zone": prov.get("trust_zone", "unknown"),
-            "eligible": not issues, "issues": issues,
-            "note": prov.get("note", ""),
-            "active_until": str(prov.get("active_until", "")),
-            "is_default": False, "dynamic": True,
-        }
-        if issues:
-            return route
-        if model in get_catalog(pname, prov):
-            return route
+        dm = prov.get("default_model")
+        if not model:
+            model = dm or ""
+        if model:
+            route = {
+                "provider": pname, "label": prov.get("label", pname), "model": model,
+                "port": None, "kind": prov.get("kind", "upb"),
+                "trust_zone": prov.get("trust_zone", "unknown"),
+                "eligible": not issues, "issues": issues,
+                "note": prov.get("note", ""),
+                "active_until": str(prov.get("active_until", "")),
+                "is_default": False, "dynamic": True,
+            }
+            if issues or model == dm:
+                return route
+            if model in get_catalog(pname, prov):
+                return route
+            # discover: loaded lanes hot-swap; a prepared-but-cold model is still
+            # runnable — the endpoint loads it on demand (~1 min first hit).
+            if prov.get("discover") == "loaded" and model in get_catalog(
+                    pname, dict(prov, discover=None), refresh=True, cache=False):
+                return route
         return None
     # static routes
     if model:
@@ -429,19 +517,21 @@ def claude_binary():
     return found
 
 
-def build_launch_env(cfg, prov, route, token, base_url, explicit_model=False):
+def build_launch_env(cfg, prov, route, token, base_url):
     env = os.environ.copy()
     env.update((cfg.get("defaults") or {}).get("claude_env") or {})
     env.update(prov.get("claude_env") or {})
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = token
-    # Ensure model identity is set for session binding propagation.
-    # When a specific model is explicitly requested (upb run provider/model),
-    # it always wins over provider-level claude_env defaults.
-    # When no model is specified (upb run provider), respect claude_env.
-    if explicit_model or "ANTHROPIC_MODEL" not in env:
+    # Model identity for session binding propagation. Provider-level
+    # claude_env may pin these; otherwise the route's model ALWAYS wins —
+    # over ambient env and over a stale session-binding.env (the claude
+    # wrapper reloads it), which previously leaked the last route's model
+    # into the new proxy (e.g. glm-5.2 sent to a zen/free route → 401).
+    prov_env = prov.get("claude_env") or {}
+    if "ANTHROPIC_MODEL" not in prov_env:
         env["ANTHROPIC_MODEL"] = route["model"]
-    if "CLAUDE_CODE_SUBAGENT_MODEL" not in env:
+    if "CLAUDE_CODE_SUBAGENT_MODEL" not in prov_env:
         env["CLAUDE_CODE_SUBAGENT_MODEL"] = route["model"]
     return env
 
@@ -493,6 +583,26 @@ def print_route_block(route, prov, endpoint_desc, key_desc):
 
 # ── commands ──────────────────────────────────────────────────────────
 
+def _list_port(prov):
+    base = prov.get("base_url", "")
+    try:
+        import re as _re
+        m = _re.search(r":(\d{2,5})(?:/|$)", base)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "-"
+
+
+def _short_model(m, width=34):
+    """Accept a bare id or a raw catalog entry dict (entries are cached whole)."""
+    if isinstance(m, dict):
+        m = m.get("id", "")
+    short = m.split("/")[-1]
+    return short[:width]
+
+
 def cmd_list(cfg, args):
     routes = list(iter_routes(cfg))
     cat_rows = [(pname, prov, provider_issues(prov))
@@ -514,36 +624,67 @@ def cmd_list(cfg, args):
         print("No eligible routes. Try: upb list --all · upb doctor")
         return 3
 
-    names = [fmt_route_name(r) for r in visible] + [p for p, _, _ in cat_visible]
-    w = max(len(n) for n in names) if names else 5
-    print(f"{'ROUTE':<{w}}  {'PORT':<5} {'ZONE':<16} STATUS")
-    noted = set()
-    for r in visible:
-        name = fmt_route_name(r)
-        port = str(r["port"]) if r["port"] else "-"
-        if r["eligible"]:
-            status = "ok" + (" · default" if r["is_default"] else "")
-        else:
-            status = "; ".join(r["issues"])
-        if args.all and r["note"] and r["provider"] not in noted:
-            status += f"  [{r['note']}]"
-            noted.add(r["provider"])
-        print(f"{name:<{w}}  {port:<5} {r['trust_zone']:<16} {status}")
+    # ── default line first — the thing you reach for ──
+    default = next((r for r in routes if r.get("is_default") and r["eligible"]), None)
+    if default:
+        print(f"\u2605 default:  {fmt_route_name(default)}  ({default['trust_zone']})")
+    print()
+
+    # ── pinned / static routes ──
+    if visible:
+        print(f"Pinned routes ({len(visible)})")
+        for r in visible:
+            star = "\u2605 " if r.get("is_default") else "  "
+            name = fmt_route_name(r)
+            if r["eligible"]:
+                extra = "default" if r["is_default"] else r["trust_zone"]
+                line = f"  {star}{name:<24} {extra}"
+                if args.all and r.get("note"):
+                    line += f"  [{r['note']}]"
+                print(line)
+            else:
+                print(f"  {star}{name:<24} UNAVAILABLE — {'; '.join(r['issues'])}")
+        print(f"  run: upb run {fmt_route_name(visible[0]) if len(visible) == 1 else '<provider>/<model>'}")
+        print()
+
+    # ── catalog providers grouped by trust zone ──
+    zones = []
     for pname, prov, issues in cat_visible:
-        cached = cached_catalog(pname)
-        n = f", {len(cached)} models cached" if cached else ""
-        if issues:
-            print(f"{pname:<{w}}  {'-':<5} {prov.get('trust_zone','unknown'):<16} "
-                  f"{'; '.join(issues)}")
-        else:
-            print(f"{pname:<{w}}  {'-':<5} {prov.get('trust_zone','unknown'):<16} "
-                  f"ok · live catalog{n}")
-            print(f"{'':<{w}}                    "
-                  f"run: upb run {pname}/<model-id> · browse: upb models {pname}")
+        z = prov.get("trust_zone", "unknown")
+        if z not in zones:
+            zones.append(z)
+    # local first, then the rest alphabetically
+    zones.sort(key=lambda z: (0 if z == "tailnet-local" else 1, z))
+
+    for z in zones:
+        rows = [(p, pr, iss) for p, pr, iss in cat_visible
+                if pr.get("trust_zone", "unknown") == z]
+        tag = "Local" if z == "tailnet-local" else ("Remote" if z == "remote-approved" else z)
+        print(f"{tag} · {z} ({len(rows)} providers)")
+        for pname, prov, issues in rows:
+            port = _list_port(prov)
+            port_s = f":{port}" if port != "-" else ""
+            if issues:
+                print(f"  {pname:<16}{port_s:<6} UNAVAILABLE — {'; '.join(issues)}")
+                continue
+            cached = cached_catalog(pname)
+            if cached:
+                rows = lane_rows(cached)
+                n = len(rows)
+                if n <= 5:
+                    shorts = ", ".join(_short_model(k) for k, _ in rows)
+                    print(f"  {pname:<16}{port_s:<6} {n} model{'s' if n != 1 else ''}: {shorts}")
+                else:
+                    egs = ", ".join(_short_model(k) for k, _ in rows[:2])
+                    print(f"  {pname:<16}{port_s:<6} {n} models · e.g. {egs}")
+            else:
+                print(f"  {pname:<16}{port_s:<6} live catalog · upb models {pname}")
+        print(f"  run: upb run {rows[0][0] if len(rows) == 1 else '<provider>'}/<model-id> · browse: upb models <provider>")
+        print()
     if not args.all:
         hidden = (len(routes) - len(visible)) + (len(cat_rows) - len(cat_visible))
         if hidden:
-            print(f"\n({hidden} more configured but hidden — upb list --all)")
+            print(f"({hidden} more configured but hidden — upb list --all)")
     return 0
 
 
@@ -561,14 +702,24 @@ def cmd_models(cfg, args):
             for m in models:
                 print(f"  {m}")
         return 0
-    models = get_catalog(args.provider, prov, refresh=args.refresh)
+    if args.all and prov.get("discover") == "loaded":
+        prov = dict(prov, discover=None)      # peek at the cold/prepared set too
+        args.refresh = True                   # bypass the hot-only cache
+    entries = get_catalog_entries(args.provider, prov, refresh=args.refresh)
+    match = prov.get("discover_match")
+    if match:
+        entries = [e for e in entries if match in e["id"]]
     if args.json:
+        # machine-facing: full ids, no collapsing — `run` takes these verbatim
+        models = [e["id"] for e in entries]
         print(json.dumps({"provider": args.provider, "count": len(models),
                           "models": models}, indent=2))
         return 0
-    print(f"{args.provider}: {len(models)} models (live catalog)")
-    for m in models:
-        print(f"  {m}")
+    rows = lane_rows(entries)
+    print(f"{args.provider}: {len(rows)} models (live catalog)")
+    w = max((len(k) for k, _ in rows), default=0)
+    for k, d in rows:
+        print(f"  {k:<{w}}  →  {d}" if d else f"  {k}")
     print(f"\nrun one: upb run {args.provider}/<model-id>")
     return 0
 
@@ -589,7 +740,7 @@ def cmd_status(cfg, args):
         key, desc = resolve_key(prov.get("key"))
         url = prov["base_url"].rstrip("/") + "/models"
         if prov.get("kind") == "anthropic-native":
-            url = prov["base_url"]
+            url = prov.get("models_base_url", prov["base_url"]).rstrip("/") + "/models"
         state, detail = http_probe(url, key or None)
         return pname, key is not None, desc, state, detail
 
@@ -672,8 +823,7 @@ def cmd_run(cfg, args):
         endpoint_desc = f"{base_url}  (direct, no proxy)"
 
     print_route_block(route, prov, endpoint_desc, key_desc)
-    explicit_model = "/" in args.route
-    env = build_launch_env(cfg, prov, route, token, base_url, explicit_model=explicit_model)
+    env = build_launch_env(cfg, prov, route, token, base_url)
     write_session_binding(env, route)
     binary = claude_binary()
     print(f"Launching claude ({route['model']})...", file=sys.stderr)
@@ -961,7 +1111,7 @@ def cmd_env(cfg, args):
     port = (cfg.get("defaults") or {}).get("port", 8705)
     # Read LOCAL_SECRET from the systemd env file (source of truth for the service)
     secret = "claude-universal-local"
-    router_env = Path("~/shared-local/reports/claude-universal/router-alibaba.env").expanduser()
+    router_env = ROUTER_ENV
     if router_env.exists():
         for line in router_env.read_text().splitlines():
             if line.startswith("LOCAL_SECRET="):
@@ -1102,8 +1252,8 @@ def cmd_sync(cfg, args):
     for c in changed:
         print(f"  • {c}")
 
-    # ── Push: secrets.env → router-alibaba.env ──
-    router_env = Path("~/shared-local/reports/claude-universal/router-alibaba.env").expanduser()
+    # ── Push: secrets.env → router.env ──
+    router_env = ROUTER_ENV
     ali_key = secrets.get("ALIBABA_TOKEN_PLAN_KEY", "")
     if ali_key and router_env.exists() and "UPB_PROVIDER='alibaba-token-plan'" in router_env.read_text():
         content = router_env.read_text()
@@ -1137,7 +1287,7 @@ def cmd_sync(cfg, args):
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] in ("-h", "--help", "help"):
-        print(__doc__.strip())
+        print(HELP_TEXT)
         return 0
 
     parser = argparse.ArgumentParser(prog="upb", add_help=False)
@@ -1148,6 +1298,8 @@ def main():
     p_models = sub.add_parser("models")
     p_models.add_argument("provider")
     p_models.add_argument("--refresh", action="store_true")
+    p_models.add_argument("--all", action="store_true",
+                          help="include prepared-but-cold models on discover: loaded lanes")
     p_models.add_argument("--json", action="store_true")
     p_verify = sub.add_parser(
         "verify", help="audit declared models against providers' live catalogs",
