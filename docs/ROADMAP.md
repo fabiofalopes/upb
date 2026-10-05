@@ -20,18 +20,26 @@ not an oversight. Personal plans/subscriptions are the fuel upb maps and
 arbitrates.
 
 **State.** G0 closed (repo is the runtime home; `scripts/check-drift.sh`
-guards the invariant). Mac-lane fanout works end-to-end (sync-macs → router
+guards the invariant). Mac-lane fanout works end-to-end (fleet renderer → router
 model_map → CLI lane aliases → collapsed `upb models` view). Remote push is
 the distribution channel — the repo on GitHub is the stable reference other
 machines pull from for larger-scale testing.
+
+> **Fleet topology is not in this repo.** The generator that described the Mac
+> lanes (and therefore every host, port and label in the fleet) lived here as
+> `scripts/sync-macs.py`. On 2026-10-05 it moved to the **private**
+> `mac-inference` repo as `control/render.py`, and its history was purged from
+> this one. upb stays transport-only: it reads a rendered provider config and
+> asks each endpoint what it serves (`catalog: live`).
 
 **Near-future spec (priority order):**
 1. **Stability pass** — the lean/robust bar: no new surface until the current
    surface (routing, failover, usage, verify, lane discovery) is boring.
 2. **Larger-scale testing** — more harnesses through one upb; watch usage +
    cooldown behavior under real load.
-3. **Mac fleet as first-class providers** — sync-macs after lane swaps is
-   manual; the failure mode (stale model_map) should be visible in `doctor`.
+3. **Mac fleet as first-class providers** — the fleet renderer after lane swaps is
+   manual (it now lives in the private `mac-inference` repo); the failure mode
+   (stale model_map) should be visible in `doctor`.
 4. **Eval-before-route** (from the 2026-10 research pass) — per-lane eval
    suites before routing a lane into rotation; extends `upb verify`.
 5. **Settings surface** — a panel/TUI is *wanted someday*, deliberately not
