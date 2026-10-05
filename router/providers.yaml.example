@@ -4,6 +4,13 @@
 # like "litellm/qwopus3.5-9b-coder", it routes to the "litellm" provider.
 #
 # Claude Code sends "claude-*" wire names → model_map translates them.
+#
+# CATALOG INVARIANT: model_map is wire-name TRANSLATION only — it is not a
+# list of what a provider serves. What a provider serves is its live /models
+# endpoint: GET /v1/models on this proxy mirrors upstream listings (cached per
+# catalog_ttl_s; 0 = always fresh), and requests for any upstream id route via
+# prefix matching without being declared here. `models:` entries (if any) carry
+# pricing metadata only. `catalog: static` opts a provider out (deprecated).
 
 version: "1"
 

@@ -104,9 +104,10 @@ Concrete unresolved items (also tracked in `WORKLOG.md`):
   `alibaba-token-plan/qwen3.8-max-preview` as the only allowed model. When the
   provider collapse happens, does the "only model" rule follow the `upb/…`
   path, and who owns that policy?
-- **zen free-model adoption** — `upb sync` surfaced new `-free` models
-  (mimo-v2.5-free, ling-3.0-flash-free, nemotron-3-ultra-free, etc.). Which are
-  wanted in `providers.zen.models`?
+- **zen free-model adoption** — resolved by the catalog invariant (2026-10):
+  adoption is automatic — any model in zen's live `/models` is browsable and
+  runnable (`upb models zen`, `upb run zen/<id>`); nothing goes into config.
+  `discover_match: free` only narrows the default display.
 
 ## Moments in time (triggers)
 

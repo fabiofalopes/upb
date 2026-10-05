@@ -41,6 +41,35 @@ client.
 
 Provider definitions and defaults come from `router/src/middleware/router-config.ts`.
 
+## Catalog (model truth)
+
+The invariant: **a provider's valid model list is whatever its live `/models`
+endpoint reports** — never a hand-maintained list.
+
+- **`GET /v1/models` (proxy)** mirrors the upstream listing
+  (`src/utils/upstream-catalog.ts`): each provider's ids are fetched, cached per
+  TTL, and served verbatim + provider-namespaced, plus the `model_map` wire
+  names the proxy actually maps. On an upstream fetch failure the last good
+  cache is served (stale-while-error); with no cache at all it falls back to the
+  configured list.
+- **TTL**: tailnet-local endpoints (hot-swapping lanes) use `0` — always fresh;
+  remote endpoints cache briefly (`CATALOG_TTL_S` in the CLI, mirrored as
+  `UPB_CATALOG_TTL` at proxy launch). A retired model disappears within one TTL.
+- **Run-time validation**: `upb run provider/<model>` and `upb default`
+  validation both hit `/models` live; a stale cache is an acceptable fallback
+  only while `/models` is briefly unreachable.
+- **`catalog: static`** is the deprecated opt-out for endpoints that serve no
+  listing — they hand-maintain `models:` and own their pin hygiene.
+- **Anthropic-native** endpoints (no OpenAI `/models` at the serving base) are
+  live only when `models_base_url` points at a real listing (e.g. z.ai paas/v4);
+  otherwise they stay static.
+- **`models:` is pricing metadata only** — it never gates validity. The CLI
+  forwards it as `UPB_PRICING` so `cost_usd` works for dynamic routes.
+- **Wire pins** (`ANTHROPIC_*`) derive from the run's model, overridable per
+  tier via `opus_model`/`sonnet_model`/`haiku_model`. `upb verify` audits every
+  pin against the live catalog: a pin naming a retired id is a hard finding
+  (exit 3), and `upb run` refuses to launch with it.
+
 ## Configuration
 
 `router-config.ts` loads config in priority order:

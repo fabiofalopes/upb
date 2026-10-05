@@ -1,4 +1,18 @@
-# Example routes config — copy to ~/.config/upb/routes.yaml and customize
+# Example routes config — copy to ~/.config/upb/routes.yaml and customize.
+#
+# THE INVARIANT: a provider's valid model list IS its live /models endpoint.
+# Nothing here enumerates served models. Models are discovered by `upb models`,
+# validated at `upb run` time against <base_url>/models (or <models_base_url>),
+# and mirrored on every proxy's own GET /v1/models.
+#
+# Optional pins (all validated against the live catalog by `upb verify` and at
+# run time — a retired id is a hard error, not a silent 404):
+#   default_model  marks a live provider eligible as the overall default route;
+#                  usage-metered providers should omit it (explicit-run only)
+#   opus_model / sonnet_model / haiku_model   wire-tier pins; everything else
+#                  derives from the run's model (claude_env entries override)
+#   models: {}     is pricing METADATA ONLY — it never gates validity
+
 version: 1
 defaults:
   claude_env:
@@ -24,61 +38,35 @@ providers:
     local_secret: claude-alibaba-poser
     priority: 10
     enabled: true
-    active_until: '2026-08-20'
-    note: qwen3.8-max-preview also persistent via systemd universal-router.service
-      (:8705)
+    default_model: qwen3.8-max-preview
+    # Pricing stays metadata (models: is never a validity list):
     models:
       qwen3.8-max-preview:
-        port: 8705
         pricing:
-          input_per_1m: 0.25   # 10% trial pricing, estimate
+          input_per_1m: 0.25
           output_per_1m: 0.75
-      qwen3.7-max:
-        port: 8704
-        pricing:
-          input_per_1m: 2.50   # list; 50% promo active Jul 2026 → effective 1.25/3.75
-          output_per_1m: 7.50
-      qwen3.7-plus:
-        port: 8703
-        pricing:
-          input_per_1m: 0.32   # ≤256K tier; 20% promo noted Jul 2026
-          output_per_1m: 1.28
-      qwen3.6-flash:
-        port: 8702
-        pricing:
-          input_per_1m: 0.26   # USD per 1M input tokens
-          output_per_1m: 1.56
       deepseek-v4-pro:
-        port: 8701
         pricing:
-          input_per_1m: 2.50   # DashScope; DeepSeek direct API is $0.44/$0.87
+          input_per_1m: 2.50
           output_per_1m: 5.00
-      glm-5.2:
-        port: 8706
-        pricing:
-          input_per_1m: 1.46   # DashScope; Z.ai direct ~$1.40/$4.40
-          output_per_1m: 4.58
   zai:
     label: Z.AI Coding Plan (year-long)
     kind: anthropic-native
     base_url: https://api.z.ai/api/anthropic
+    # Anthropic-native endpoints don't speak OpenAI /models; point the catalog
+    # at the paas listing so it is audited and live-validated like the rest.
+    models_base_url: https://api.z.ai/api/paas/v4
     trust_zone: remote-approved
     key:
       type: env
       var: ZAI_API_KEY
     priority: 20
     enabled: true
-    note: plan models per docs.z.ai (2026-08) — glm-5.2 / glm-5-turbo / glm-4.7
-    models:
-      glm-5.2: {}
-      glm-5-turbo: {}
-      glm-4.7: {}
-    claude_env:
-      ANTHROPIC_MODEL: glm-5.2
-      ANTHROPIC_DEFAULT_OPUS_MODEL: glm-5.2
-      ANTHROPIC_DEFAULT_SONNET_MODEL: glm-5.2
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: glm-5-turbo
-      CLAUDE_CODE_SUBAGENT_MODEL: glm-5-turbo
+    default_model: glm-5.2
+    haiku_model: glm-5-turbo   # cheap tier for subagents/haiku
+    # No claude_env model pins needed — wire names derive from the route model
+    # and the role keys above. (Hand-pinning ANTHROPIC_MODEL* is still allowed
+    # but `upb verify` checks each pin against the live catalog.)
   zen:
     label: OpenCode Zen (free tier)
     kind: upb
@@ -90,93 +78,28 @@ providers:
     priority: 30
     enabled: true
     cooldown_seconds: 39600   # free-tier exhaustion cooldown (~11h per panopticon HANDOFF)
-    # discover: report new upstream models matching discover_match during upb sync
-    discover: true
+    # discover_match: narrow `upb models` to ids containing this substring
+    # (free tier only — the full catalog is always fetched and run-validated).
     discover_match: free
-    models:
-      deepseek-v4-flash-free:
-        port: 8801
-      big-pickle:
-        port: 8802
-      north-mini-code-free:
-        port: 8803
-  mistral:
-    label: Mistral (Vibe plan)
+    default_model: deepseek-v4-flash-free
+  opencode-go:
+    label: OpenCode Go subscription ($10/mo)
     kind: upb
-    base_url: https://api.mistral.ai/v1
+    base_url: https://opencode.ai/zen/go/v1
     trust_zone: remote-approved
     key:
       type: env
-      var: MISTRAL_API_KEY
-    priority: 35   # between zen (30) and litellm (40)
+      var: OPENCODE_GO_KEY
+    local_secret: claude-ogo-poser
+    priority: 35
     enabled: true
     headers:
-      User-Agent: mistral-client-python/Mistral-Vibe/2.21.0   # mimic Vibe CLI client so requests match the plan's expected client
-    # Model ids verified callable with the Vibe key on 2026-08-17 (all HTTP 200).
-    # Billing split (docs.mistral.ai/deployment/laplateforme/pricing): the three
-    # mistral-vibe-cli-* models are the Pro-subscription surface (flat fee);
-    # platform models are metered — they draw down the Pro plan's included
-    # monthly API credits pay-as-you-go. Pricing below ≈ credit burn rate.
-    models:
-      mistral-vibe-cli-fast:
-        port: 8810   # subscription-included (Vibe CLI "fast")
-      mistral-vibe-cli-latest:
-        port: 8811   # subscription-included (Vibe CLI default)
-      mistral-vibe-cli-with-tools:
-        port: 8812   # subscription-included (Vibe CLI tools variant)
-      mistral-medium-latest:
-        port: 8813
-        pricing:
-          input_per_1m: 1.50
-          output_per_1m: 7.50
-      mistral-large-latest:
-        port: 8814
-        pricing:
-          input_per_1m: 0.50
-          output_per_1m: 1.50
-      mistral-small-latest:
-        port: 8815
-        pricing:
-          input_per_1m: 0.15
-          output_per_1m: 0.60
-      codestral-latest:
-        port: 8816
-        pricing:
-          input_per_1m: 0.30
-          output_per_1m: 0.90
-      magistral-small-latest:
-        port: 8817
-        pricing:
-          input_per_1m: 0.50
-          output_per_1m: 1.50
-      voxtral-small-latest:
-        port: 8818
-        pricing:
-          input_per_1m: 0.10   # + $0.004/min audio — token pricing covers text
-          output_per_1m: 0.40
-  litellm:
-    label: Lusófona LiteLLM Gateway
-    kind: upb
-    upb_provider: litellm
-    base_url: https://modelos.ai.ulusofona.pt/v1
-    trust_zone: remote-approved
-    key:
-      type: env
-      var: LITELLM_API_KEY
-    local_secret: claude-litellm-poser
-    priority: 40
-    enabled: true
-    models:
-      ornith-9b:
-        port: 8901
-      omnicoder-9b:
-        port: 8903
-      amalia-9b:
-        port: 8902   # ported from panopticon (G10) — the one ULusofona model upb lacked
+      x-opencode-session: upb-proxy-stable
+    # No default_model: subscription spend limits make it explicit-run only.
+    models: {}
   prime-intellect:
     label: PrimeIntellect Inference (pay-per-use)
     kind: upb
-    upb_provider: pinference
     base_url: https://api.pinference.ai/api/v1
     trust_zone: remote-approved
     key:
@@ -185,98 +108,17 @@ providers:
     local_secret: upb-pi-poser
     priority: 50
     enabled: true
-    catalog: live
-    note: usage-metered, balance unknown — explicit runs only, never the default
+    # usage-metered, balance unknown — explicit runs only, never the default
     models: {}
-  pi-own:
-    label: PrimeIntellect own instance (ephemeral)
-    kind: upb
-    upb_provider: pi-own
-    base_url: http://127.0.0.1:8090/v1
-    trust_zone: remote-approved
-    key: none
-    local_secret: upb-piown-poser
-    priority: 55
-    enabled: true
-    note: gpu-deploy managed; alias qwen35-abl; teardown.sh to stop
-    models:
-      qwen35-abl:
-        port: 8931
-  deepseek:
-    label: DeepSeek (native Anthropic protocol)
-    kind: anthropic-native
-    base_url: https://api.deepseek.com/anthropic
-    trust_zone: remote-approved
-    key:
-      type: env
-      var: DEEPSEEK_API_KEY
-    priority: 60
-    enabled: false
-    note: key missing — add DEEPSEEK_API_KEY to ~/.config/upb/secrets.env then re-enable
-    models:
-      deepseek-v4-pro:
-        primary: true
-      deepseek-v4-flash: {}
-    claude_env:
-      API_TIMEOUT_MS: '3000000'
-      ANTHROPIC_MODEL: deepseek-v4-pro[1m]
-      ANTHROPIC_DEFAULT_OPUS_MODEL: deepseek-v4-pro[1m]
-      ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-v4-pro[1m]
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
-      CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
-      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1'
-      CLAUDE_CODE_EFFORT_LEVEL: max
-  ollama-cloud:
-    label: Ollama Cloud
-    kind: upb
-    upb_provider: ollama-local
-    base_url: https://ollama.com/v1
-    trust_zone: remote-approved
-    key:
-      type: envfile
-      path: ~/.hermes/.env
-      var: OLLAMA_API_KEY
-    local_secret: claude-ollama-poser
-    priority: 90
-    enabled: false
-    models:
-      deepseek-v4-pro:
-        port: 8546
-      deepseek-v4-flash:
-        port: 8536
-      deepseek-v3.2:
-        port: 8611
-      gemini-3-flash-preview:
-        port: 8561
-      gemma4:31b:
-        port: 8489
-      glm-5.2:
-        port: 8579
-      glm-5.1:
-        port: 8449
-      glm-5:
-        port: 8502
-      kimi-k2.7-code:
-        port: 8613
-      kimi-k2.6:
-        port: 8592
-      minimax-m3:
-        port: 8498
-      minimax-m2.7:
-        port: 8447
-      qwen3-coder-next:
-        port: 8504
-      qwen3-coder:480b:
-        port: 8642
-      qwen3.5:397b:
-        port: 8525
-      mistral-large-3:675b:
-        port: 8637
-      gpt-oss:120b:
-        port: 8557
-      devstral-2:123b:
-        port: 8599
-      nemotron-3-super:
-        port: 8529
-      nemotron-3-ultra:
-        port: 8477
+  # ── DEPRECATED OPT-OUT ── endpoints that serve no /models listing. Avoid:
+  # you hand-maintain truth that drifts silently. The escape hatch exists for
+  # exotic self-hosted servers; `upb models`/`verify`/`run` fall back to the
+  # `models:` list for these, and wire pins are your responsibility.
+  # legacy-local:
+  #   kind: upb
+  #   catalog: static
+  #   base_url: http://some-box:9999/v1
+  #   key: none
+  #   models:
+  #     only-model:
+  #       pricing: {input_per_1m: 0.0, output_per_1m: 0.0}

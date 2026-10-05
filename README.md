@@ -10,8 +10,16 @@ touching your client again.
 
 The practical effect: Claude Code stops being hardwired to Anthropic. You get
 one central provider tool for your whole workflow, and you can move fast —
-swap models, A/B providers, or fall back to a free tier by editing one YAML
-file, not by rewriting your setup.
+swap providers or fall back to a free tier by editing one YAML file, not by
+rewriting your setup.
+
+The catalog invariant: **a provider's valid model list is whatever its live
+`/models` endpoint reports** — never a hand-maintained list. `upb models`
+fetches it, `upb run` validates against it, every proxy mirrors it on its own
+`GET /v1/models`, and `upb verify` fails on any pin naming a retired id. When
+a provider adds or drops a model, you find out by asking the endpoint, not by
+auditing config. (`catalog: static` is a deprecated opt-out for endpoints with
+no listing.)
 
 ## Why
 
@@ -98,8 +106,8 @@ existing config after backing it up). Full reference in
 | `upb stop [ROUTE \| --all]` | Stop proxies spawned by `upb` (never the systemd one) |
 | `upb default` | Show the default route |
 | `upb doctor` | Config, keys, ports, binaries, hygiene checks |
-| `upb models PROVIDER [--refresh]` | List a provider's models (live fetch for `catalog: live`) |
-| `upb verify [PROVIDER] [--probe] [--json]` | Audit declared models against each provider's live catalog; `--probe` adds a 1-token entitlement check per model (real billable calls on metered models) |
+| `upb models PROVIDER [--refresh]` | List a provider's models — always the live `/models` fetch (the invariant) |
+| `upb verify [PROVIDER] [--probe] [--json]` | Audit model pins (`default_model`, role keys, `claude_env`) against each provider's live catalog — a retired id is a hard finding; `--probe` adds a 1-token entitlement check (real billable calls on metered models) |
 | `upb sync [--full]` | Pull keys → `secrets.env` → generate/update `router.env` |
 | `upb env` | Print shell exports pointing at the persistent router |
 
@@ -148,7 +156,7 @@ Anthropic protocol directly and are passed through without a local proxy.
 | `zai` | anthropic-native | yes | Z.AI coding plan (GLM family) |
 | `deepseek` | anthropic-native | yes | Native Anthropic-protocol endpoint |
 | `litellm` | upb | yes | LiteLLM gateway (multi-model) |
-| `prime-intellect` | upb | yes | Pay-per-use, `catalog: live` (explicit runs only) |
+| `prime-intellect` | upb | yes | Pay-per-use; live catalog, explicit runs only (no `default_model`) |
 | `zen` | upb | no | OpenCode Zen free tier |
 | `mistral` | upb | yes | Vibe/Pro subscription — 3 `mistral-vibe-cli-*` models + platform catalog; UA header required |
 | `ollama` | upb | yes | Local or cloud Ollama |
