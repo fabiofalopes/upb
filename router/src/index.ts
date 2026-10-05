@@ -10,6 +10,7 @@
 
 import http from 'node:http';
 import path from 'node:path';
+import { Agent } from 'undici';
 import { validateAuth } from './middleware/auth.js';
 import { loadConfig } from './middleware/config.js';
 import { loadRouterConfig, type ProviderDefinition, type RouterConfig } from './middleware/router-config.js';
@@ -30,6 +31,13 @@ const routerCfg = loadRouterConfig();
 const PORT = routerCfg.defaults.port;
 const MAX_RETRIES = routerCfg.defaults.retries;
 const LOCAL_SECRET = process.env.LOCAL_SECRET || routerCfg.defaults.local_secret;
+
+// Upstream transport: undici's default 300s headersTimeout kills long NON-streaming
+// generations — llama.cpp sends no response headers until generation completes, and a
+// 35K-token prefill on a slow lane takes ~520s (observed 2026-09-21: "fetch failed" → 502
+// while the lane actually finished the work). Disable the transport-level timeouts and
+// let the per-provider timeout (AbortSignal below) be the single bound.
+const UPSTREAM_AGENT = new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 15_000 });
 
 // ── Provider Cooldown ──
 
@@ -60,11 +68,23 @@ function resolveProvider(
   if (prefix && routerCfg.providers[prefix]) {
     const def = routerCfg.providers[prefix];
     const adapter = getAdapterForProvider(prefix, def);
+    // A model_map entry for the stripped name (or the namespaced key) lets a
+    // friendly alias reach a provider whose upstream id differs — e.g. an mlx
+    // server that requires a full model path. Same legacy prefix-stripping
+    // rule as the model_map branch below.
+    const mapped = def.model_map?.[modelName] ?? def.model_map?.[model];
+    let upstreamModel = modelName;
+    if (mapped) {
+      const mappedSlashIdx = mapped.indexOf('/');
+      const mappedPrefix = mappedSlashIdx > 0 ? mapped.slice(0, mappedSlashIdx) : '';
+      const stripPrefix = mappedSlashIdx > 0 && Boolean(routerCfg.providers[mappedPrefix]);
+      upstreamModel = stripPrefix ? mapped.slice(mappedSlashIdx + 1) : mapped;
+    }
     return {
       name: prefix,
       definition: def,
       adapter,
-      model: modelName,
+      model: upstreamModel,
     };
   }
 
@@ -90,6 +110,10 @@ function resolveProvider(
   }
 
   // Fall back to active provider
+  // NOTE: when the active provider was set via UPB_* env (single-provider mode),
+  // the incoming "prefix/model" is an upstream org/model id (e.g. PrimeIntellect's
+  // "deepseek/deepseek-v4-flash") — the prefix is NOT a provider. Send the FULL
+  // model string, never the stripped remainder.
   const fallback = routerCfg.providers[routerCfg.active_provider];
   if (fallback) {
     const adapter = getAdapterForProvider(routerCfg.active_provider, fallback);
@@ -97,7 +121,7 @@ function resolveProvider(
       name: routerCfg.active_provider,
       definition: fallback,
       adapter,
-      model: modelName || model,
+      model: model,
     };
   }
 
@@ -221,30 +245,28 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const now = Math.floor(Date.now() / 1000);
 
     for (const [name, def] of Object.entries(routerCfg.providers)) {
-      // If provider has a model_map, expose those
-      if (def.model_map) {
-        for (const [wireName, mappedModel] of Object.entries(def.model_map)) {
-          models.push({
-            id: mappedModel,
-            object: 'model',
-            created: now,
-            owned_by: name,
-          });
+      if (def.enabled === false) continue;
+      // List the ids a client can actually send: provider-namespaced model ids
+      // (prefix-routed), claude-* wire names (model_map-routed), and the BARE
+      // LANE ALIAS (model_map key === provider name) — the short id we type:
+      //   upb run <mac-big>/glm53flash   instead of
+      //   upb run <mac-big>/glm53flash/GLM-5.3-Flash-GGUF
+      const push = (id: string) => {
+        if (id && !models.find(m => m.id === id)) {
+          models.push({ id, object: 'model', created: now, owned_by: name });
         }
+      };
+      for (const modelId of Object.keys(def.models || {})) {
+        push(`${name}/${modelId}`);
+      }
+      for (const key of Object.keys(def.model_map || {})) {
+        if (key.startsWith(`${name}/`) || key.startsWith('claude-') || key === name) push(key);
       }
     }
 
-    // Also expose claude-* wire names for Claude Code compatibility
-    for (const wireName of ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5']) {
-      if (!models.find(m => m.id === wireName)) {
-        models.push({
-          id: wireName,
-          object: 'model',
-          created: now,
-          owned_by: 'universal-router',
-        });
-      }
-    }
+    // Claude Code wire names are advertised only when a provider actually maps
+    // them (the loop above already lists model_map keys) — advertising an
+    // unmapped wire name would resolve to the active provider and 404.
 
     res.writeHead(200, {
       'Content-Type': 'application/json',
@@ -299,6 +321,10 @@ async function handleOpenAIRequest(req: http.IncomingMessage, res: http.ServerRe
   const model = (body.model as string) || 'unknown';
   const isStream = body.stream === true;
 
+  // Normalize reasoning_effort for local lanes whose chat templates accept only
+  // xhigh/medium/low (e.g. RVN Qwen3.8: "high" raises a Jinja exception → 500 → cooldown).
+  if (body.reasoning_effort === 'high') body.reasoning_effort = 'xhigh';
+
   // Resolve provider
   let resolved: ResolvedProvider;
   try {
@@ -343,7 +369,7 @@ async function handleOpenAIRequest(req: http.IncomingMessage, res: http.ServerRe
 
 async function handleAnthropicRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Auth check
-  const authResult = validateAuth(req.headers as Record<string, string | string[] | undefined>);
+  const authResult = validateAuth(req.headers as Record<string, string | string[] | undefined>, LOCAL_SECRET);
   if (!authResult.authenticated) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: authResult.error! }));
@@ -434,7 +460,8 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
         headers: outboundHeaders,
         body: JSON.stringify(openaiRequest),
         signal: AbortSignal.timeout(resolved.adapter.timeout),
-      });
+        dispatcher: UPSTREAM_AGENT,
+      } as RequestInit);
 
       if (!providerRes.ok) {
         if (providerRes.status === 429) {
@@ -503,7 +530,7 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
 // ── Count Tokens ──
 
 async function handleCountTokens(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const authResult = validateAuth(req.headers as Record<string, string | string[] | undefined>);
+  const authResult = validateAuth(req.headers as Record<string, string | string[] | undefined>, LOCAL_SECRET);
   if (!authResult.authenticated) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: authResult.error! }));
@@ -563,7 +590,8 @@ async function forwardToProvider(
         headers,
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(adapter.timeout),
-      });
+        dispatcher: UPSTREAM_AGENT,
+      } as RequestInit);
 
       if (!providerRes.ok) {
         let errorText = '';

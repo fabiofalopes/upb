@@ -1,14 +1,20 @@
 // ── Auth Middleware ──
-// Validates inbound x-api-key or Authorization: Bearer against LOCAL_SECRET env var
+// Validates inbound x-api-key or Authorization: Bearer against the router's
+// local secret: an explicit expectedSecret (config defaults.local_secret) wins,
+// else the LOCAL_SECRET env var, else the historical default.
 
-const LOCAL_SECRET = process.env.LOCAL_SECRET || 'claude-universal-local';
+const ENV_SECRET = process.env.LOCAL_SECRET || 'claude-universal-local';
 
 export interface AuthResult {
   authenticated: boolean;
   error?: { type: string; message: string };
 }
 
-export function validateAuth(headers: Record<string, string | string[] | undefined>): AuthResult {
+export function validateAuth(
+  headers: Record<string, string | string[] | undefined>,
+  expectedSecret?: string,
+): AuthResult {
+  const LOCAL_SECRET = expectedSecret || ENV_SECRET;
   // Extract the API key from x-api-key header
   const apiKey = headers['x-api-key'];
 

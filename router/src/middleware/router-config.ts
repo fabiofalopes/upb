@@ -153,6 +153,16 @@ function buildFromEnv(): RouterConfig {
     } catch { /* ignore */ }
   }
 
+  const headersStr = process.env.UPB_HEADERS;
+  if (headersStr) {
+    try {
+      provider.headers = JSON.parse(headersStr);
+    } catch { /* ignore */ }
+  } else if (adapter === 'opencode-go') {
+    // opencode-go upstream requires x-opencode-session (enforced 2026-09-05)
+    provider.headers = { 'x-opencode-session': 'upb-proxy-stable' };
+  }
+
   return {
     version: '1',
     defaults: {

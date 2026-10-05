@@ -13,6 +13,7 @@
     "proxy:models": "curl -s http://localhost:${PORT:-8443}/v1/models"
   },
   "dependencies": {
+    "undici": "^7.29.1",
     "yaml": "^2.7.0"
   },
   "devDependencies": {
