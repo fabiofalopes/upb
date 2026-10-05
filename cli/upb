@@ -283,15 +283,33 @@ def cached_catalog(pname, ttl=CATALOG_TTL_S):
     return None
 
 
+def catalog_ttl(prov):
+    """How long a live catalog may be reused for this provider (seconds).
+
+    Tailnet-local endpoints are free, fast and change whenever a lane is
+    swapped — always ask them. (Hit live 2026-10-05: a retired lane stayed
+    listed for an hour because of the default TTL.) Remote catalogs are
+    rate-limited and change rarely, so they keep the long TTL. An explicit
+    `catalog_ttl` on the provider overrides both.
+    """
+    if "catalog_ttl" in prov:
+        return prov["catalog_ttl"]
+    if prov.get("trust_zone") == "tailnet-local":
+        return 0
+    return CATALOG_TTL_S
+
+
 def get_catalog_entries(pname, prov, refresh=False, cache=True):
     if not refresh:
         # hot-swap lanes (unsloth studio) change their loaded set on every lane
-        # swap — a long TTL would serve stale "loaded" models. 60s keeps run/
-        # list honest without hammering the endpoint.
+        # swap — a long TTL would serve stale "loaded" models. Local endpoints
+        # (tailnet-local) use ttl=0: always live.
         hot = prov.get("discover") == "loaded"
-        hit = cached_catalog(pname, ttl=60 if hot else CATALOG_TTL_S)
-        if hit:
-            return hit
+        ttl = 60 if hot else catalog_ttl(prov)
+        if ttl > 0:
+            hit = cached_catalog(pname, ttl=ttl)
+            if hit:
+                return hit
     key, desc = resolve_key(prov.get("key"))
     if key is None:
         die(f"key unavailable for {pname}: {desc}", 3)
