@@ -301,14 +301,14 @@
    "y": 658,
    "width": 508,
    "height": 124,
-   "text": "WINNER  \u2014  first survivor\n\nalibaba/glm-5.2\nthe binding key \u2014 never a raw model id",
+   "text": "WINNER  \u2014  first survivor\n\ndeepseek/deepseek-v4-pro\nthe binding key \u2014 never a raw model id",
    "fontSize": 17,
    "fontFamily": 1,
    "strokeColor": "#1e1e1e",
    "textAlign": "center",
    "verticalAlign": "middle",
    "containerId": "shape_10",
-   "originalText": "WINNER  \u2014  first survivor\n\nalibaba/glm-5.2\nthe binding key \u2014 never a raw model id",
+   "originalText": "WINNER  \u2014  first survivor\n\ndeepseek/deepseek-v4-pro\nthe binding key \u2014 never a raw model id",
    "autoResize": true
   },
   {

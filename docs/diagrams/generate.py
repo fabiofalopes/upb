@@ -304,7 +304,7 @@ def slot_resolution():
     # 4. the winner
     c.shape(300, 650, 520, 140, GREEN,
             ["WINNER  —  first survivor", "",
-             "alibaba/glm-5.2", "the binding key — never a raw model id"], size=17)
+             "deepseek/deepseek-v4-pro", "the binding key — never a raw model id"], size=17)
     c.arrow(820, 720, 880, 720, color=STROKE_GREEN)
 
     # 5. the unresolved state

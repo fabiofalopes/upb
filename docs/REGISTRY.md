@@ -111,7 +111,7 @@ graph TD
     S["primary.coding<br/><i>intent slot</i>"]
     C["CANDIDATES<br/>prefer: deepseek-v4-pro · glm-5.2 · MiniMax-M3<br/>fallback: glm-5-turbo · kimi-k2.7-code"]
     F["FILTERS — must pass all<br/>1 capability: tools · ctx ≥ 100k · reasoning<br/>2 status: not deprecated · provider routable<br/>3 price: input ≤ $3.00/M"]
-    W["WINNER<br/>alibaba/glm-5.2<br/><i>the binding key</i>"]
+    W["WINNER<br/>deepseek/deepseek-v4-pro<br/><i>the binding key</i>"]
     U["UNRESOLVED — and it says why"]
     R["rejected<br/>reported, not silent"]
 
@@ -135,13 +135,20 @@ model would be unroutable.
 ```console
 $ upb registry resolve primary.coding --json
 {
-  "binding": "alibaba/glm-5.2",
-  "canonical": "zhipuai/glm-5.2",
+  "binding": "deepseek/deepseek-v4-pro",
+  "canonical": "deepseek/deepseek-v4-pro-0813",
   "status": "active",
   "tier": "prefer",
-  "considered": ["alibaba/glm-5.2", "ollama-cloud/glm-5.2"]
+  "reference": "deepseek/deepseek-v4-pro",
+  "considered": ["deepseek/deepseek-v4-pro", "ollama-cloud/deepseek-v4-pro"]
 }
 ```
+
+Note what that output says: the slot named a *canonical* model, the resolver
+considered every provider serving it, and it handed back a **binding key** —
+provider plus the id that provider actually uses. `ollama-cloud` serves the
+same canonical model as `deepseek-v4-pro:0813`; the winner is whichever
+binding ranks best on status and provider priority.
 
 ## Where everything sits
 
