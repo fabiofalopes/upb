@@ -18,6 +18,9 @@
 #   upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
 #   upb default                     show the default route
 #   upb doctor                      config, keys, ports, binaries, hygiene
+#   upb registry build|show|validate|resolve|slots|drift
+#                                   canonical model registry (models/bindings/slots)
+#   upb snapshot [--label L]        record what was running right now
 #
 # Providers with `catalog: live` discover models from /v1/models at runtime;
 # any listed model can be run on demand (upb run provider/<model-id>). A live
@@ -41,6 +44,9 @@ Usage:
   upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
   upb default                     show the default route
   upb doctor                      config, keys, ports, binaries, hygiene
+  upb registry build|show|validate|resolve|slots|drift
+                                 canonical model registry (models/bindings/slots)
+  upb snapshot [--label L]        record what was running right now
 
 Providers with `catalog: live` discover models from /v1/models at runtime;
 any listed model can be run on demand (upb run provider/<model-id>). A live
@@ -51,8 +57,10 @@ Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify finding
             · 4 spawn failed"""
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1300,6 +1308,968 @@ def cmd_sync(cfg, args):
     return 0
 
 
+# ── registry ─────────────────────────────────────────────────────────────
+#
+# Why this layer exists: provider ids churn. A model gets renamed, sunset, or
+# served under a different name next month — while the *capability* you want
+# does not change. The registry keeps three layers separate so a rename is a
+# one-line binding edit instead of a config rewrite:
+#
+#   models{}    canonical identity (provider-agnostic). Survives renames.
+#   bindings{}  where a canonical model is served (provider + provider-scoped
+#               id). THIS is the churny layer, so status lives here.
+#   slots{}     intent ("primary.coding"): capability contracts that route to
+#               a binding. The routing target is never a raw id.
+#
+# Generated facts (canonical id, price, capabilities, upstream status) come
+# from models.dev. Manual decisions (status: backup, slots, notes, key_slots)
+# live in registry.yaml and survive `upb registry build`.
+#
+# Secrets never appear here: auth is a reference (env var name, op:// path),
+# never a value.
+
+REGISTRY_PATH = Path(os.environ.get("UPB_REGISTRY", "~/.config/upb/registry.yaml")).expanduser()
+SNAPSHOT_DIR = Path(os.environ.get("UPB_SNAPSHOTS", "~/.local/share/upb/snapshots")).expanduser()
+MODELS_DEV_URL = "https://models.dev/api.json"
+MODELS_DEV_TTL_S = 4 * 3600
+HERMES_MODELS_DEV_CACHE = Path(
+    os.environ.get("UPB_MODELS_DEV_CACHE", "~/.hermes/models_dev_cache.json")).expanduser()
+BINDING_STATUSES = ("active", "backup", "deprecated", "unknown")
+STATUS_RANK = {"active": 0, "backup": 1, "unknown": 2, "deprecated": 3}
+STALE_STATUS_DAYS = 7
+
+# routes.yaml provider name -> models.dev provider id, when they differ.
+MODELS_DEV_ALIASES = {
+    "zen": "opencode",
+    "opencode-zen": "opencode",
+    "prime-intellect": "prime",
+    "pi-own": "prime",
+}
+
+
+# ── models.dev ──────────────────────────────────────────────────────────
+
+def _http_get_json(url, headers=None, timeout=20):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "upb/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def load_models_dev(refresh=False):
+    """models.dev registry: {provider_id: {name, api, env, models: {id: {...}}}}.
+
+    Cached under UPB_CACHE. Falls back to Hermes' own models.dev cache (same
+    upstream, same shape) when offline, so the registry still builds on a
+    plane. That fallback is the reason this works with no network at all.
+    """
+    local = CACHE_DIR / "models_dev.json"
+    if not refresh:
+        for cand in (local, HERMES_MODELS_DEV_CACHE):
+            try:
+                if cand.exists() and time.time() - cand.stat().st_mtime < MODELS_DEV_TTL_S:
+                    return json.loads(cand.read_text(), strict=False)
+            except (OSError, ValueError):
+                continue
+    try:
+        data = _http_get_json(MODELS_DEV_URL)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text(json.dumps(data))
+        return data
+    except Exception:
+        for cand in (local, HERMES_MODELS_DEV_CACHE):
+            try:
+                if cand.exists():
+                    return json.loads(cand.read_text(), strict=False)
+            except (OSError, ValueError):
+                continue
+    return {}
+
+
+def models_dev_id_for(pname, prov, mdev):
+    """models.dev namespace for a routes.yaml provider.
+
+    Explicit `models_dev_id:` in routes.yaml wins; then exact match, then the
+    alias table, then a normalized match. None means the provider is a private
+    gateway whose ids models.dev does not track (its models are still usable,
+    they simply have no canonical identity upstream).
+    """
+    explicit = (prov.get("models_dev_id") or "").strip()
+    if explicit:
+        return explicit if explicit in mdev else None
+    if pname in mdev:
+        return pname
+    alias = MODELS_DEV_ALIASES.get(pname)
+    if alias and alias in mdev:
+        return alias
+    norm = re.sub(r"[-_]", "", pname).lower()
+    for k in mdev:
+        if re.sub(r"[-_]", "", k).lower() == norm:
+            return k
+    return None
+
+
+def global_model_index(mdev):
+    """model_id -> (canonical_id, model_entry), built across every provider.
+
+    A provider's models.dev namespace is incomplete by nature: `alibaba` does
+    not list `glm-5.3` even though `alibaba-token-plan` does, and the same
+    model appears under different ids per provider. Canonical identity is a
+    property of the *model*, not of the provider namespace, so it is resolved
+    from a global index built over every provider's entries.
+
+    Entries carrying a canonical_model_id win; otherwise the first provider
+    that serves the id supplies the metadata.
+    """
+    index = {}
+    for pid, p in (mdev or {}).items():
+        for mid, m in (p.get("models") or {}).items():
+            if not isinstance(m, dict):
+                continue
+            canon = (m.get("canonical_model_id") or "").strip()
+            cur = index.get(mid)
+            if cur is None:
+                index[mid] = (canon, m, pid)
+            elif canon and not cur[0]:
+                # a provider that knows the canonical id supersedes one that does not
+                index[mid] = (canon, m, pid)
+            elif canon and cur[0] and canon != cur[0] and pid < cur[2]:
+                index[mid] = (canon, m, pid)
+    return {mid: (canon, entry) for mid, (canon, entry, _pid) in index.items()}
+
+
+def canonical_of(mdev_model):
+    """Provider-agnostic identity for a models.dev model entry.
+
+    models.dev ships `canonical_model_id` on ~85% of provider-scoped entries;
+    the rest fall back to family/id, which is still stable enough to bind to.
+    """
+    if not mdev_model:
+        return ""
+    c = str(mdev_model.get("canonical_model_id") or "").strip()
+    if c:
+        return c
+    mid = str(mdev_model.get("id") or "").strip()
+    fam = str(mdev_model.get("family") or "").strip()
+    return f"{fam}/{mid}" if fam else mid
+
+
+def _mdev_caps(m):
+    """Capability flags from a models.dev model entry."""
+    if not m:
+        return {}
+    mods = (m.get("modalities") or {}).get("input") or []
+    return {
+        "tools": bool(m.get("tool_call")),
+        "reasoning": bool(m.get("reasoning")),
+        "structured_output": bool(m.get("structured_output")),
+        "vision": bool(m.get("attachment")) or "image" in mods,
+        "pdf": "pdf" in mods,
+        "temperature": bool(m.get("temperature")),
+        "open_weights": bool(m.get("open_weights")),
+    }
+
+
+def _mdev_limits(m):
+    if not m:
+        return None, None
+    lim = m.get("limit") or {}
+    return lim.get("context"), lim.get("output")
+
+
+def _mdev_cost(m):
+    if not m:
+        return {}
+    c = m.get("cost") or {}
+    return {
+        "input_per_1m": c.get("input"),
+        "output_per_1m": c.get("output"),
+        "cache_read_per_1m": c.get("cache_read"),
+        "source": "models.dev",
+    }
+
+
+# ── registry build ──────────────────────────────────────────────────────
+
+def _auth_ref(key_spec):
+    """Turn a routes.yaml key spec into a *reference*. Never the value."""
+    if key_spec in (None, "none"):
+        return {"type": "none"}
+    if not isinstance(key_spec, dict):
+        return {"type": "unknown"}
+    t = key_spec.get("type")
+    if t == "env":
+        return {"type": "env", "var": key_spec.get("var")}
+    if t == "envfile":
+        return {"type": "envfile", "path": str(key_spec.get("path", "")), "var": key_spec.get("var")}
+    if t == "json":
+        return {"type": "json", "path": str(key_spec.get("path", "")), "at": key_spec.get("at")}
+    if t == "file":
+        return {"type": "file", "path": str(key_spec.get("path", ""))}
+    return {"type": str(t or "unknown")}
+
+
+def _merge_fact(gen, prev_entry, key):
+    """models.dev wins when it knows the answer; the hand edit wins when it doesn't."""
+    if gen in (None, "", {}, []):
+        return (prev_entry or {}).get(key)
+    return gen
+
+
+def load_registry():
+    """Current registry.yaml (empty skeleton when absent)."""
+    try:
+        if REGISTRY_PATH.exists():
+            data = yaml.safe_load(REGISTRY_PATH.read_text())
+            if isinstance(data, dict):
+                return data
+    except (OSError, yaml.YAMLError):
+        pass
+    return {"schema_version": 1, "providers": {}, "models": {}, "bindings": {}, "slots": {}}
+
+
+def build_registry(cfg, mdev=None, live_catalogs=None):
+    """Merge routes.yaml + models.dev (+ live catalog observations) into a registry.
+
+    Manual fields from an existing registry.yaml survive the rebuild: a
+    binding marked `status: backup` stays a backup even after models.dev
+    changes its mind, and slots/notes/key_slots are never touched.
+    """
+    if mdev is None:
+        mdev = load_models_dev()
+    prev = load_registry()
+    prev_models = prev.get("models") or {}
+    prev_bindings = prev.get("bindings") or {}
+    prev_providers = prev.get("providers") or {}
+
+    reg = {
+        "schema_version": 1,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "providers": {},
+        "models": {},
+        "bindings": {},
+        "slots": prev.get("slots") or {},
+    }
+    now = date.today().isoformat()
+
+    global_index = global_model_index(mdev)
+
+    for pname, prov in sorted_providers(cfg):
+        mdev_pid = models_dev_id_for(pname, prov, mdev)
+        pm = (mdev.get(mdev_pid) or {}) if mdev_pid else {}
+        pm_models = pm.get("models") or {}
+        prev_p = prev_providers.get(pname) or {}
+
+        reg["providers"][pname] = {
+            "display_name": prov.get("label", pname),
+            "kind": prov.get("kind", "upb"),
+            "billing": prov.get("billing", "unknown"),
+            "trust_zone": prov.get("trust_zone", "unknown"),
+            "base_url": prov.get("base_url"),
+            # `enabled` in routes.yaml means "eligible as the DEFAULT route",
+            # not "the provider is unavailable". A metered provider that must
+            # never be the default is still a perfectly good slot target, so
+            # the two are tracked separately here.
+            "enabled": bool(prov.get("enabled", True)),
+            "routable": bool(prov.get("slot_routable", True)),
+            "models_dev_id": mdev_pid,
+            "auth": _auth_ref(prov.get("key")),
+            "key_slots": prev_p.get("key_slots", []),
+            "priority": prov.get("priority", 50),
+            "status": "active" if prov.get("enabled", True) else "not-default",
+        }
+
+        for model, mcfg in (prov.get("models") or {}).items():
+            mcfg = mcfg or {}
+            bkey = f"{pname}/{model}"
+            mdev_m = pm_models.get(model)
+            if mdev_m is None:
+                # not in this provider's namespace — resolve identity globally
+                gcanon, gentry = global_index.get(model, (None, None))
+                if gentry is not None:
+                    mdev_m = dict(gentry)
+                    mdev_m.setdefault("_canonical_override", gcanon)
+            gcanon = (mdev_m or {}).get("_canonical_override")
+            canonical = (gcanon or canonical_of(mdev_m)
+                         or (prev_bindings.get(bkey) or {}).get("canonical")
+                         or f"{pname}/{model}")
+
+            # ── canonical model entry ──
+            pm_prev = prev_models.get(canonical) or {}
+            ctx, maxout = _mdev_limits(mdev_m)
+            gen_caps = _mdev_caps(mdev_m)
+            entry = dict(pm_prev)
+            entry["display_name"] = _merge_fact(
+                (mdev_m or {}).get("name"), pm_prev, "display_name") or model
+            entry["family"] = _merge_fact((mdev_m or {}).get("family"), pm_prev, "family") or ""
+            entry["vendor"] = canonical.split("/")[0] if "/" in canonical else ""
+            entry["release_date"] = _merge_fact(
+                (mdev_m or {}).get("release_date"), pm_prev, "release_date") or ""
+            entry["open_weights"] = _merge_fact(
+                bool(gen_caps.get("open_weights")), pm_prev, "open_weights")
+            entry["capabilities"] = {**gen_caps, **(pm_prev.get("capabilities") or {})}
+            entry["context_window"] = _merge_fact(ctx, pm_prev, "context_window")
+            entry["max_output_tokens"] = _merge_fact(maxout, pm_prev, "max_output_tokens")
+            if pm_prev.get("aliases"):
+                entry["aliases"] = pm_prev["aliases"]
+            reg["models"][canonical] = entry
+
+            # ── binding entry ──
+            prev_b = prev_bindings.get(bkey) or {}
+            upstream_status = str((mdev_m or {}).get("status") or "")
+            present = None
+            if live_catalogs is not None and pname in live_catalogs:
+                present = model in set(live_catalogs[pname])
+
+            if prev_b.get("status_source") == "manual" and prev_b.get("status"):
+                status, source = prev_b["status"], "manual"
+            elif upstream_status == "deprecated":
+                # The provider's own catalogue outranks a community catalog: a
+                # model it still serves is not deprecated in practice.
+                if present is True:
+                    status, source = "active", "provider_api"
+                else:
+                    status, source = "deprecated", "models.dev"
+            elif present is True:
+                status, source = "active", "provider_api"
+            elif present is False:
+                status, source = "unknown", "provider_api"
+            elif mdev_m:
+                status, source = "active", "models.dev"
+            else:
+                status, source = "unknown", "manual"
+
+            price = _mdev_cost(mdev_m)
+            if (prev_b.get("price") or {}).get("source") == "manual":
+                price = prev_b["price"]
+            elif not price:
+                price = prev_b.get("price") or {}
+            if mcfg.get("pricing"):
+                # routes.yaml pricing wins when models.dev has nothing.
+                price = {
+                    "input_per_1m": (mcfg["pricing"].get("input_per_1m")
+                                     if price.get("input_per_1m") is None else price.get("input_per_1m")),
+                    "output_per_1m": (mcfg["pricing"].get("output_per_1m")
+                                      if price.get("output_per_1m") is None else price.get("output_per_1m")),
+                    "cache_read_per_1m": price.get("cache_read_per_1m"),
+                    "source": price.get("source") or "routes.yaml",
+                }
+
+            binding = {
+                "provider": pname,
+                "model_id": model,
+                "canonical": canonical,
+                "status": status,
+                "status_source": source,
+                "status_checked_at": now,
+                "upstream_status": upstream_status or None,
+                "deprecation_date": prev_b.get("deprecation_date"),
+                "deprecation_source": prev_b.get("deprecation_source"),
+                "superseded_by": prev_b.get("superseded_by"),
+                "price": price,
+                "observed": {
+                    "in_provider_catalog": present,
+                    "last_seen_at": now if present else prev_b.get("observed", {}).get("last_seen_at"),
+                    "renamed_to": prev_b.get("observed", {}).get("renamed_to"),
+                },
+                "notes": prev_b.get("notes", ""),
+            }
+            reg["bindings"][bkey] = binding
+
+    # derived: a deprecated binding points at its live replacement when one exists
+    for bkey, b in reg["bindings"].items():
+        if b.get("status") != "deprecated" or b.get("superseded_by"):
+            continue
+        canon = b.get("canonical")
+        live = sorted(k for k, o in reg["bindings"].items()
+                      if o.get("canonical") == canon and o.get("status") == "active")
+        if live:
+            b["superseded_by"] = live[0]
+    return reg
+
+
+def write_registry(reg, out_path=None):
+    path = Path(out_path).expanduser() if out_path else REGISTRY_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = ("# upb canonical registry — generated by `upb registry build`.\n"
+              "# Manual edits survive a rebuild: status_source: manual, slots, notes,\n"
+              "# key_slots and canonical overrides are yours; the rest is regenerated.\n")
+    path.write_text(header + yaml.safe_dump(reg, sort_keys=False, default_flow_style=False,
+                                             allow_unicode=True))
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+# ── slot resolution (the router-of-routers core) ────────────────────────
+
+def _meets_require(model, require):
+    """Does a canonical model satisfy a slot's capability contract?"""
+    caps = (model or {}).get("capabilities") or {}
+    for k, v in (require or {}).items():
+        if k == "context_window_min":
+            if int((model or {}).get("context_window") or 0) < int(v):
+                return False
+        elif k == "max_output_min":
+            if int((model or {}).get("max_output_tokens") or 0) < int(v):
+                return False
+        elif k == "capability":
+            wanted = v if isinstance(v, list) else [v]
+            for c in wanted:
+                if not caps.get(c):
+                    return False
+        elif k == "canonical_prefix":
+            if not str((model or {}).get("family") or "").startswith(str(v)):
+                return False
+        elif caps.get(k) != v:
+            return False
+    return True
+
+
+def _within_ceiling(price, ceiling, applies_to="input"):
+    """Is a binding's price under a slot's cost ceiling?
+
+    Which side the ceiling applies to matters and is easy to get wrong. Agentic
+    coding spends most tokens on input (a long context re-read every turn), so
+    the default is the *input* price. A slot can say otherwise explicitly:
+
+        cost_ceiling_per_1m: 3.00
+        cost_ceiling_applies_to: input | output | max
+
+    A binding with no price for the chosen side is treated as within the
+    ceiling — an unknown price is not evidence of an expensive one, and
+    blocking every unpriced binding would make local/free models unroutable.
+    """
+    if ceiling in (None, ""):
+        return True
+    try:
+        cap = float(ceiling)
+    except (TypeError, ValueError):
+        return True
+    mode = (applies_to or "input").lower()
+    if mode == "max":
+        keys = ("input_per_1m", "output_per_1m")
+    else:
+        keys = (f"{mode}_per_1m",)
+    for k in keys:
+        v = (price or {}).get(k)
+        if v in (None, ""):
+            continue
+        try:
+            if float(v) > cap:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
+def resolve_slot(reg, cfg, slot_name):
+    """Resolve an intent slot to a concrete binding key.
+
+    A slot names canonical models (or bindings) in preference order. This picks
+    the best provider that actually serves one of them right now: enabled,
+    not deprecated, contract satisfied, price under the ceiling, key present.
+    """
+    slots = reg.get("slots") or {}
+    slot = slots.get(slot_name)
+    if not slot:
+        return None, {"error": f"unknown slot '{slot_name}'", "known": sorted(slots)}
+    require = slot.get("require") or {}
+    ceiling = slot.get("cost_ceiling_per_1m")
+    bindings = reg.get("bindings") or {}
+    models = reg.get("models") or {}
+    providers = reg.get("providers") or {}
+
+    for tier in ("prefer", "fallback"):
+        for ref in slot.get(tier) or []:
+            cands = [(bk, b) for bk, b in bindings.items()
+                     if b.get("canonical") == ref or bk == ref]
+            if not cands:
+                continue
+            scored = []
+            for bk, b in cands:
+                prov = providers.get(b.get("provider")) or {}
+                if prov.get("routable") is False:
+                    continue
+                if b.get("status") == "deprecated":
+                    continue
+                if not _meets_require(models.get(b.get("canonical")) or {}, require):
+                    continue
+                if not _within_ceiling(b.get("price") or {}, ceiling,
+                                       slot.get("cost_ceiling_applies_to", "input")):
+                    continue
+                scored.append((STATUS_RANK.get(b.get("status"), 2),
+                               prov.get("priority", 50), bk, b))
+            if scored:
+                scored.sort(key=lambda t: (t[0], t[1], t[2]))
+                rank, _prio, bk, b = scored[0]
+                return bk, {
+                    "slot": slot_name, "tier": tier, "reference": ref,
+                    "provider": b.get("provider"), "model_id": b.get("model_id"),
+                    "canonical": b.get("canonical"), "status": b.get("status"),
+                    "considered": [s[2] for s in scored],
+                }
+    return None, {"error": "no binding satisfies the slot", "slot": slot_name,
+                  "prefer": slot.get("prefer") or [], "fallback": slot.get("fallback") or []}
+
+
+# ── validation ──────────────────────────────────────────────────────────
+
+_SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{16,})|(AIza[0-9A-Za-z_\-]{20,})"
+                        r"|(eyJ[A-Za-z0-9_\-]{30,})")
+
+
+def validate_registry(reg):
+    """Enforce the registry field rules. Returns (errors, warnings)."""
+    errors, warnings = [], []
+    providers = reg.get("providers") or {}
+    models = reg.get("models") or {}
+    bindings = reg.get("bindings") or {}
+    slots = reg.get("slots") or {}
+
+    seen = set()
+    for bkey, b in sorted(bindings.items()):
+        st = b.get("status")
+        if st not in BINDING_STATUSES:
+            errors.append(f"{bkey}: status '{st}' not in {BINDING_STATUSES}")
+        if b.get("provider") and b.get("model_id"):
+            ident = (b["provider"], b["model_id"])
+            if ident in seen:
+                errors.append(f"{bkey}: duplicate provider+model_id {ident}")
+            seen.add(ident)
+        canon = b.get("canonical")
+        if canon and canon not in models:
+            errors.append(f"{bkey}: canonical '{canon}' not defined in models{{}}")
+        if st == "deprecated":
+            if not b.get("status_checked_at"):
+                errors.append(f"{bkey}: deprecated binding has no status_checked_at")
+            if b.get("status_source") == "manual" and not b.get("deprecation_source"):
+                warnings.append(f"{bkey}: deprecated by hand without a deprecation_source")
+        if b.get("deprecation_date") and not b.get("deprecation_source"):
+            errors.append(f"{bkey}: deprecation_date without deprecation_source")
+        checked = b.get("status_checked_at")
+        if checked:
+            try:
+                age = (date.today() - date.fromisoformat(str(checked)[:10])).days
+                if age > STALE_STATUS_DAYS:
+                    warnings.append(f"{bkey}: status checked {age}d ago — stale")
+            except ValueError:
+                warnings.append(f"{bkey}: unparseable status_checked_at '{checked}'")
+        else:
+            warnings.append(f"{bkey}: no status_checked_at")
+
+    for sname, slot in sorted(slots.items()):
+        for ref in list(slot.get("prefer") or []) + list(slot.get("fallback") or []):
+            known = ref in bindings or ref in models
+            if not known:
+                errors.append(f"slot '{sname}': '{ref}' is neither a binding nor a canonical model")
+        bt = slot.get("bind_to")
+        if bt and bt not in bindings and bt not in models:
+            errors.append(f"slot '{sname}': bind_to '{bt}' does not resolve")
+        require = slot.get("require") or {}
+        for ref in slot.get("prefer") or []:
+            m = models.get(ref)
+            if m and not _meets_require(m, require):
+                warnings.append(f"slot '{sname}': preferred '{ref}' does not satisfy require{{}}")
+
+    blob = yaml.safe_dump(reg, sort_keys=False)
+    if _SECRET_RE.search(blob):
+        errors.append("registry contains something that looks like secret material")
+
+    for pname, p in sorted(providers.items()):
+        if p.get("auth", {}).get("type") == "none" and p.get("base_url", "").startswith("https://"):
+            warnings.append(f"provider '{pname}': remote endpoint with no auth")
+    return errors, warnings
+
+
+# ── live catalogs & drift ───────────────────────────────────────────────
+
+def collect_live_catalogs(cfg):
+    """Live model ids per provider, for providers that expose /models."""
+    out = {}
+    for pname, prov in sorted_providers(cfg):
+        if not prov.get("base_url"):
+            continue
+        if prov.get("kind") == "anthropic-native":
+            continue
+        ids, err = _list_provider_models(prov)
+        if err is None and ids is not None:
+            out[pname] = sorted(ids)
+    return out
+
+
+def _id_family(model_id):
+    """Family of a provider-scoped id, without any registry lookup.
+
+    Strips the provider's own version suffix (":0813", ":120b") and a trailing
+    version token, so "deepseek-v4-pro:0813" and "deepseek-v4-pro" land in the
+    same family. This is what lets a rename be spotted without trusting any
+    external catalog.
+    """
+    base = str(model_id or "").split(":", 1)[0].strip()
+    return re.sub(r"[-_.]?(v\d+(\.\d+)*|\d{4,})$", "", base).strip("-_.").lower()
+
+
+def detect_renames(prev_snapshot, cur_snapshot, reg=None):
+    """Provider ids that disappeared, matched to ids that arrived.
+
+    A rename is an id that left the provider's catalogue while a new id
+    arrived carrying the same family ("deepseek-v4-pro" -> "deepseek-v4-pro:0813").
+    A 1:1 pairing is an exact rename; when several leave and several arrive in
+    the same family the pairing is reported as ambiguous rather than guessed.
+
+    This is how "the provider changed the model name under us" becomes a fact
+    instead of a hunch.
+    """
+    renames = []
+    prev_cats = (prev_snapshot or {}).get("catalogs") or {}
+    cur_cats = (cur_snapshot or {}).get("catalogs") or {}
+
+    for pname, prev_ids in prev_cats.items():
+        cur_ids = cur_cats.get(pname)
+        if cur_ids is None:
+            continue
+        removed = sorted(set(prev_ids) - set(cur_ids))
+        added = sorted(set(cur_ids) - set(prev_ids))
+        if not removed or not added:
+            continue
+        by_family = {}
+        for a in added:
+            by_family.setdefault(_id_family(a), []).append(a)
+        for r in removed:
+            fam = _id_family(r)
+            cands = by_family.get(fam) or []
+            if len(cands) == 1:
+                renames.append({"provider": pname, "from": r, "to": cands[0],
+                                "family": fam, "confidence": "exact"})
+            elif len(cands) > 1:
+                renames.append({"provider": pname, "from": r, "to": None,
+                                "family": fam, "confidence": "ambiguous",
+                                "candidates": cands})
+    return renames
+
+
+def compute_drift(cfg, reg=None, live=None):
+    """Compare the registry against live catalogues and upstream metadata."""
+    reg = reg if reg is not None else load_registry()
+    live = live if live is not None else collect_live_catalogs(cfg)
+    bindings = reg.get("bindings") or {}
+    out = {"checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+           "providers": {}, "missing_upstream": [], "not_served": [],
+           "deprecated_upstream": [], "new_upstream": [], "catalogs": live}
+    for pname, prov in sorted_providers(cfg):
+        if not prov.get("base_url"):
+            continue
+        ids = live.get(pname)
+        declared = [b for b in bindings.values() if b.get("provider") == pname]
+        if ids is None:
+            out["providers"][pname] = {"status": "no_catalog", "declared": len(declared)}
+            continue
+        live_set = set(ids)
+        missing = sorted(b["model_id"] for b in declared if b["model_id"] not in live_set)
+        extra = sorted(i for i in ids
+                        if i not in {b["model_id"] for b in declared})
+        out["providers"][pname] = {
+            "status": "ok", "live_count": len(ids), "declared": len(declared),
+            "not_served": missing, "new_upstream": extra,
+        }
+        for m in missing:
+            out["not_served"].append({"provider": pname, "model_id": m})
+        for m in extra:
+            out["new_upstream"].append({"provider": pname, "model_id": m})
+        for b in declared:
+            if b.get("status") == "deprecated":
+                out["deprecated_upstream"].append({
+                    "provider": pname, "model_id": b["model_id"],
+                    "canonical": b.get("canonical"),
+                    "superseded_by": b.get("superseded_by"),
+                })
+    return out
+
+
+# ── snapshots ───────────────────────────────────────────────────────────
+
+def snapshot_path(label=None):
+    ts = datetime.now().strftime("%Y-%m-%dT%H%M%S")
+    return SNAPSHOT_DIR / f"{ts}{('-' + label) if label else ''}.json"
+
+
+def take_snapshot(cfg, label=None, live=None):
+    """Record what was running right now: routes, registry, live catalogues.
+
+    This is the answer to "what was I on at time T" — the file is small,
+    diffable, and holds the raw evidence (catalogue ids), not just the
+    derived state.
+    """
+    live = live if live is not None else collect_live_catalogs(cfg)
+    reg = load_registry()
+    try:
+        routes_raw = CONFIG_PATH.read_bytes()
+        routes_sha = hashlib.sha256(routes_raw).hexdigest()
+    except OSError:
+        routes_raw, routes_sha = b"", ""
+    snap = {
+        "taken_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "label": label,
+        "routes_path": short_path(CONFIG_PATH),
+        "routes_sha256": routes_sha,
+        "providers": {
+            p: {
+                "label": prov.get("label", p),
+                "base_url": prov.get("base_url"),
+                "enabled": prov.get("enabled", True),
+                "priority": prov.get("priority", 50),
+                "declared_models": sorted((prov.get("models") or {}).keys()),
+            }
+            for p, prov in sorted_providers(cfg)
+        },
+        "catalogs": live,
+        "bindings": {
+            k: {"canonical": v.get("canonical"), "status": v.get("status"),
+                "status_source": v.get("status_source"),
+                "price": v.get("price"),
+                "observed": v.get("observed")}
+            for k, v in (reg.get("bindings") or {}).items()
+        },
+        "slots": reg.get("slots") or {},
+    }
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    path = snapshot_path(label)
+    path.write_text(json.dumps(snap, indent=2, sort_keys=True))
+    return path, snap
+
+
+def latest_snapshot():
+    if not SNAPSHOT_DIR.exists():
+        return None
+    files = sorted(SNAPSHOT_DIR.glob("*.json"))
+    return files[-1] if files else None
+
+
+# ── commands ────────────────────────────────────────────────────────────
+
+def _registry_rows(reg):
+    """Rows for display: one per canonical model, with its bindings."""
+    by_canon = {}
+    for bkey, b in (reg.get("bindings") or {}).items():
+        by_canon.setdefault(b.get("canonical") or bkey, []).append((bkey, b))
+    rows = []
+    for canon, items in by_canon.items():
+        model = (reg.get("models") or {}).get(canon) or {}
+        statuses = sorted({b.get("status") for _k, b in items})
+        rank = min(STATUS_RANK.get(s, 2) for s in statuses)
+        rows.append({
+            "canonical": canon,
+            "display_name": model.get("display_name") or canon,
+            "family": model.get("family") or "",
+            "status": [s for s in ("active", "backup", "unknown", "deprecated") if s in statuses],
+            "rank": rank,
+            "context_window": model.get("context_window"),
+            "price": next((b.get("price") for _k, b in items if b.get("price")), {}),
+            "bindings": [{"binding": k, "provider": b.get("provider"),
+                          "model_id": b.get("model_id"), "status": b.get("status"),
+                          "status_source": b.get("status_source"),
+                          "observed": (b.get("observed") or {}).get("in_provider_catalog")}
+                         for k, b in sorted(items)],
+        })
+    rows.sort(key=lambda r: (r["rank"], r["canonical"]))
+    return rows
+
+
+def cmd_registry(cfg, args):
+    action = args.registry_cmd or "show"
+
+    if action == "build":
+        mdev = load_models_dev(refresh=args.refresh)
+        live = None if args.no_live else collect_live_catalogs(cfg)
+        reg = build_registry(cfg, mdev=mdev, live_catalogs=live)
+        errors, warnings = validate_registry(reg)
+        path = write_registry(reg, args.out)
+        if args.json:
+            print(json.dumps({"registry": str(path), "providers": len(reg["providers"]),
+                              "models": len(reg["models"]), "bindings": len(reg["bindings"]),
+                              "slots": len(reg["slots"]),
+                              "errors": errors, "warnings": warnings}, indent=2))
+        else:
+            print(f"wrote {short_path(path)}")
+            print(f"  providers: {len(reg['providers'])}")
+            print(f"  canonical models: {len(reg['models'])}")
+            print(f"  bindings: {len(reg['bindings'])}")
+            print(f"  slots: {len(reg['slots'])}")
+            if errors:
+                print(f"  validation errors: {len(errors)}")
+                for e in errors[:10]:
+                    print(f"    ✗ {e}")
+            if warnings:
+                print(f"  warnings: {len(warnings)}")
+                for w in warnings[:10]:
+                    print(f"    ! {w}")
+        return 3 if errors else 0
+
+    if action == "show":
+        reg = load_registry()
+        rows = _registry_rows(reg)
+        if args.status and args.status != "all":
+            rows = [r for r in rows if args.status in r["status"]]
+        if args.json:
+            print(json.dumps({"registry": str(REGISTRY_PATH), "models": rows,
+                              "slots": reg.get("slots") or {}}, indent=2))
+            return 0
+        if not rows:
+            print("registry is empty — build it with: upb registry build")
+            return 3
+        label = {"active": "ACTIVE", "backup": "BACKUP",
+                 "deprecated": "DEPRECATED", "unknown": "UNKNOWN"}
+        for status in ("active", "backup", "unknown", "deprecated"):
+            group = [r for r in rows if status in r["status"]]
+            if not group:
+                continue
+            print(f"\n{label[status]} ({len(group)})")
+            for r in group:
+                ctx = r.get("context_window")
+                price = r.get("price") or {}
+                pin = (f"${price.get('input_per_1m')}/M in"
+                       if price.get("input_per_1m") is not None else "price n/a")
+                print(f"  {r['canonical']}")
+                detail = f"ctx={ctx}" if ctx else "ctx n/a"
+                print(f"    {detail} · {pin} · {r['display_name']}")
+                for b in r["bindings"]:
+                    seen = {True: "in-catalog", False: "NOT served",
+                            None: "unverified"}[b["observed"]]
+                    print(f"      - {b['binding']:<44} [{b['status']}] "
+                          f"{seen} (src: {b['status_source']})")
+        slots = reg.get("slots") or {}
+        if slots:
+            print("\nSLOTS (intent → resolved binding)")
+            for sname, slot in sorted(slots.items()):
+                bk, info = resolve_slot(reg, cfg, sname)
+                target = bk or f"UNRESOLVED — {info.get('error')}"
+                print(f"  {sname:<24} → {target}")
+        return 0
+
+    if action == "validate":
+        reg = load_registry()
+        errors, warnings = validate_registry(reg)
+        if args.json:
+            print(json.dumps({"errors": errors, "warnings": warnings,
+                              "ok": not errors}, indent=2))
+        else:
+            for e in errors:
+                print(f"  ✗ {e}")
+            for w in warnings:
+                print(f"  ! {w}")
+            print(f"\n{len(errors)} errors, {len(warnings)} warnings")
+        return 3 if errors else 0
+
+    if action == "resolve":
+        reg = load_registry()
+        bk, info = resolve_slot(reg, cfg, args.slot)
+        if args.json:
+            print(json.dumps({"binding": bk, **info}, indent=2))
+        elif bk:
+            print(bk)
+            print(f"  canonical: {info.get('canonical')}  status: {info.get('status')}")
+            print(f"  tier: {info.get('tier')}  via reference: {info.get('reference')}")
+            print(f"  considered: {', '.join(info.get('considered') or [])}")
+        else:
+            die(f"slot '{args.slot}' unresolved: {info.get('error')}", 3)
+        return 0 if bk else 3
+
+    if action == "slots":
+        reg = load_registry()
+        slots = reg.get("slots") or {}
+        if args.json:
+            print(json.dumps(slots, indent=2))
+            return 0
+        if not slots:
+            print("no slots defined — add them to registry.yaml under 'slots:'")
+            return 3
+        for sname, slot in sorted(slots.items()):
+            bk, info = resolve_slot(reg, cfg, sname)
+            print(f"{sname}")
+            print(f"  require: {json.dumps(slot.get('require') or {})}")
+            if slot.get("cost_ceiling_per_1m") is not None:
+                print(f"  cost ceiling: ${slot['cost_ceiling_per_1m']}/M")
+            print(f"  prefer:  {', '.join(slot.get('prefer') or [])}")
+            print(f"  fallback: {', '.join(slot.get('fallback') or [])}")
+            print(f"  resolves to: {bk or 'UNRESOLVED — ' + str(info.get('error'))}")
+        return 0
+
+    if action == "drift":
+        drift = compute_drift(cfg)
+        if args.json:
+            print(json.dumps(drift, indent=2))
+            return 0
+        prev = latest_snapshot()
+        reg = load_registry()
+        renames = []
+        if prev:
+            try:
+                renames = detect_renames(json.loads(prev.read_text()),
+                                         {"catalogs": drift.get("catalogs") or {}}, reg)
+            except (OSError, ValueError):
+                renames = []
+        print(f"checked {len(drift['providers'])} providers at {drift['checked_at']}")
+        for pname, info in drift["providers"].items():
+            if info.get("status") != "ok":
+                print(f"  {pname}: {info.get('status')}")
+                continue
+            bits = [f"{info['live_count']} live", f"{info['declared']} declared"]
+            if info.get("not_served"):
+                bits.append(f"{len(info['not_served'])} not served")
+            if info.get("new_upstream"):
+                bits.append(f"{len(info['new_upstream'])} new upstream")
+            print(f"  {pname}: {', '.join(bits)}")
+        if drift["not_served"]:
+            print("\nnot served (declared but absent from the provider catalogue):")
+            for row in drift["not_served"]:
+                print(f"  ✗ {row['provider']}/{row['model_id']}")
+        if drift["deprecated_upstream"]:
+            print("\ndeprecated upstream:")
+            for row in drift["deprecated_upstream"]:
+                sup = row.get("superseded_by") or "no replacement"
+                print(f"  ! {row['provider']}/{row['model_id']} → {sup}")
+        if drift["new_upstream"]:
+            print("\nnew upstream (not declared):")
+            for row in drift["new_upstream"][:20]:
+                print(f"  + {row['provider']}/{row['model_id']}")
+        if renames:
+            print("\npossible renames (id left, new id arrived):")
+            for r in renames:
+                print(f"  ~ {r['provider']}: {r['from']} → {r['to']} "
+                      f"({r['confidence']}, {r['canonical']})")
+        return 3 if (drift["not_served"] or drift["deprecated_upstream"]) else 0
+
+    die(f"unknown registry action '{action}'", 2)
+
+
+def cmd_snapshot(cfg, args):
+    prev = latest_snapshot()
+    path, snap = take_snapshot(cfg, label=args.label)
+    reg = load_registry()
+    renames = []
+    if prev:
+        try:
+            renames = detect_renames(json.loads(prev.read_text()), snap, reg)
+        except (OSError, ValueError):
+            renames = []
+    if args.json:
+        print(json.dumps({"snapshot": str(path), "taken_at": snap["taken_at"],
+                          "renames": renames}, indent=2))
+        return 0
+    print(f"wrote {short_path(path)}")
+    print(f"  providers: {len(snap['providers'])}")
+    print(f"  catalogues captured: {sum(len(v) for v in snap['catalogs'].values())} ids "
+          f"across {len(snap['catalogs'])} providers")
+    print(f"  routes sha256: {snap['routes_sha256'][:16]}…")
+    if renames:
+        print("  renames detected:")
+        for r in renames:
+            print(f"    ~ {r['provider']}: {r['from']} → {r['to']} ({r['confidence']})")
+    return 0
+
+
 # ── main ──────────────────────────────────────────────────────────────
 
 def main():
@@ -1355,13 +2325,67 @@ def main():
                         help="skip the new-model discovery check")
     sub.add_parser("env")
 
+    p_reg = sub.add_parser(
+        "registry",
+        help="canonical model registry: build, show, validate, resolve slots, drift",
+        description="The canonical registry keeps three layers apart so a provider "
+                    "renaming a model is a one-line edit instead of a config "
+                    "rewrite: models{} (provider-agnostic identity), bindings{} "
+                    "(where it is served — the churny layer, where status lives), "
+                    "slots{} (intent: capability contracts the router resolves to "
+                    "a live binding). Facts come from models.dev; manual decisions "
+                    "(status, slots, notes, key_slots) survive a rebuild. Secrets "
+                    "never appear — auth is a reference.")
+    reg_sub = p_reg.add_subparsers(dest="registry_cmd")
+    p_reg_build = reg_sub.add_parser(
+        "build", help="rebuild registry.yaml from routes.yaml + models.dev")
+    p_reg_build.add_argument("--refresh", action="store_true",
+                             help="ignore the cached models.dev registry")
+    p_reg_build.add_argument("--no-live", action="store_true",
+                             help="skip live provider catalogue probes")
+    p_reg_build.add_argument("--out", help="write to this path instead of the default")
+    p_reg_build.add_argument("--json", action="store_true")
+    p_reg_show = reg_sub.add_parser("show", help="show the registry grouped by status")
+    p_reg_show.add_argument("--status", default="all",
+                             help="filter: active | backup | deprecated | unknown | all")
+    p_reg_show.add_argument("--json", action="store_true")
+    p_reg_val = reg_sub.add_parser("validate", help="enforce the registry field rules")
+    p_reg_val.add_argument("--json", action="store_true")
+    p_reg_res = reg_sub.add_parser("resolve", help="resolve a slot to a live binding")
+    p_reg_res.add_argument("slot")
+    p_reg_res.add_argument("--json", action="store_true")
+    p_reg_slots = reg_sub.add_parser("slots", help="list intent slots and what they resolve to")
+    p_reg_slots.add_argument("--json", action="store_true")
+    p_reg_drift = reg_sub.add_parser(
+        "drift", help="compare the registry against live provider catalogues")
+    p_reg_drift.add_argument("--json", action="store_true")
+
+    p_snap = sub.add_parser(
+        "snapshot",
+        help="record what was running right now (routes + registry + catalogues)",
+        description="Writes a timestamped JSON snapshot of the routing state: "
+                    "the routes.yaml digest, every provider's live catalogue, and "
+                    "the registry's bindings with their status. This is the "
+                    "answer to 'what was I running at time T'. Comparing two "
+                    "snapshots surfaces provider renames.")
+    p_snap.add_argument("--label", help="label for this snapshot (e.g. before-upgrade)")
+    p_snap.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     cfg = load_cfg()
     cmd = args.cmd or "list"
+    # `upb registry` with no subcommand behaves like `upb registry show`
+    if cmd == "registry" and not getattr(args, "registry_cmd", None):
+        args.registry_cmd = "show"
+        args.status = "all"
+        args.json = False
+    if cmd == "snapshot":
+        args.label = getattr(args, "label", None)
+        args.json = getattr(args, "json", False)
     handlers = {"list": cmd_list, "models": cmd_models, "verify": cmd_verify,
                 "status": cmd_status, "run": cmd_run, "stop": cmd_stop,
                 "default": cmd_default, "doctor": cmd_doctor, "sync": cmd_sync,
-                "env": cmd_env}
+                "env": cmd_env, "registry": cmd_registry, "snapshot": cmd_snapshot}
     # `upb` with no subcommand behaves like `upb list`
     if args.cmd is None:
         args.all = False
