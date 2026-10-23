@@ -24,6 +24,51 @@ HERE = Path(__file__).resolve().parent
 # polyline, which is visually close enough for review.
 FONT = "Helvetica, Arial, sans-serif"
 
+# Real text measurement. PIL is in the hermes venv; fall back to an estimate
+# elsewhere. Without this, a label's true width is unknown and long strings
+# silently overflow their box.
+_PIL = None
+_FONT_CACHE = {}
+_FONT_PATH = "/System/Library/Fonts/Supplemental/Arial.ttf"
+
+
+def _pil():
+    global _PIL
+    if _PIL is None:
+        try:
+            from PIL import ImageFont
+            _PIL = ImageFont
+        except Exception:
+            _PIL = False
+    return _PIL or None
+
+
+def text_width(s, size):
+    """Width of `s` at `size` px, measured not guessed."""
+    pf = _pil()
+    if pf:
+        key = int(size * 4)
+        font = _FONT_CACHE.get(key)
+        if font is None:
+            try:
+                font = pf.truetype(_FONT_PATH, int(size))
+            except Exception:
+                font = pf.load_default()
+            _FONT_CACHE[key] = font
+        try:
+            return font.getlength(s)
+        except Exception:
+            pass
+    return len(s) * size * 0.52
+
+
+def fit_size(s, max_w, start=16, floor=11):
+    """Largest font size (<= start) at which `s` fits `max_w`."""
+    size = start
+    while size > floor and text_width(s, size) > max_w:
+        size -= 1
+    return size
+
 
 def esc(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -144,9 +189,10 @@ def render(path: Path, out_svg: bool = False) -> Path:
                 cx = container.get("x", 0) + container.get("width", 0) / 2
                 cy = container.get("y", 0) + container.get("height", 0) / 2
                 lh = size * 1.25
+                # centre the whole block vertically inside the container
                 ty = cy - (len(lines) - 1) * lh / 2 - size * 0.78
                 for i, ln in enumerate(lines):
-                    wpx = len(ln) * size * 0.52
+                    wpx = text_width(ln, size)
                     out.append(f'<text x="{cx - wpx/2:.0f}" y="{ty + i*lh:.0f}" '
                                f'font-family="{fam}" font-size="{size}" fill="{color}" '
                                f'text-anchor="start">{esc(ln)}</text>')

@@ -37,6 +37,35 @@ STROKE_AMBER = "#f59e0b"
 STROKE_CYAN = "#06b6d4"
 
 
+_FONT_PATH = "/System/Library/Fonts/Supplemental/Arial.ttf"
+_font_cache = {}
+
+
+def _measure(s, size):
+    """Measured text width in px. PIL if available, else a close estimate."""
+    try:
+        from PIL import ImageFont
+        key = int(size * 4)
+        font = _font_cache.get(key)
+        if font is None:
+            try:
+                font = ImageFont.truetype(_FONT_PATH, int(size))
+            except Exception:
+                font = ImageFont.load_default()
+            _font_cache[key] = font
+        return font.getlength(s)
+    except Exception:
+        return len(s) * size * 0.52
+
+
+def _fit(s, max_w, size):
+    """Largest size <= `size` at which `s` fits `max_w`."""
+    out = size
+    while out > 11 and _measure(s, out) > max_w:
+        out -= 1
+    return out
+
+
 class Canvas:
     def __init__(self):
         self.elements = []
@@ -65,9 +94,21 @@ class Canvas:
         return eid
 
     def shape(self, x, y, w, h, fill, lines, size=18, stroke=INK, radius=True):
-        """A shape with bound (container) text. `lines` is a str or list."""
+        """A shape with bound (container) text. `lines` is a str or list.
+
+        The text is shrunk to fit the box if it would overflow — measured, not
+        guessed, so a long label degrades to a smaller font instead of
+        spilling over the border.
+        """
         eid = self._id("shape")
         body = lines if isinstance(lines, str) else "\n".join(lines)
+        nlines = body.count("\n") + 1
+        max_w = w - 16
+        for ln in body.split("\n"):
+            size = min(size, _fit(ln, max_w, size))
+        # shrink further if the block is taller than the box
+        while size > 11 and nlines * size * 1.25 > h - 8:
+            size -= 1
         self.elements.append({
             "type": "rectangle", "id": eid, "x": x, "y": y, "width": w, "height": h,
             "strokeColor": stroke, "backgroundColor": fill, "fillStyle": "solid",
