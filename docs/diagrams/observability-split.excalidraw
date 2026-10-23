@@ -1,0 +1,517 @@
+{
+ "type": "excalidraw",
+ "version": 2,
+ "source": "hermes-agent",
+ "elements": [
+  {
+   "type": "text",
+   "id": "txt_1",
+   "x": 60,
+   "y": 36,
+   "width": 743.6,
+   "height": 33.800000000000004,
+   "text": "Two different questions \u2014 two different data sources",
+   "fontSize": 26,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "Two different questions \u2014 two different data sources",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "zone_2",
+   "x": 60,
+   "y": 110,
+   "width": 660,
+   "height": 330,
+   "strokeColor": "#d0d0d0",
+   "backgroundColor": "#dbe4ff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 1,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   }
+  },
+  {
+   "type": "text",
+   "id": "zt_3",
+   "x": 74,
+   "y": 120,
+   "width": 300,
+   "height": 24,
+   "text": "API SPEND \u2014 dollars",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "API SPEND \u2014 dollars",
+   "autoResize": true
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_4",
+   "x": 90,
+   "y": 160,
+   "width": 280,
+   "height": 120,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#a5d8ff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_4_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_4_t",
+   "x": 96,
+   "y": 168,
+   "width": 268,
+   "height": 104,
+   "text": "Proxy responses\nusage objects\nper token, per key",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_4",
+   "originalText": "Proxy responses\nusage objects\nper token, per key",
+   "autoResize": true
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_5",
+   "x": 410,
+   "y": 160,
+   "width": 280,
+   "height": 120,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#a5d8ff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_5_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_5_t",
+   "x": 416,
+   "y": 168,
+   "width": 268,
+   "height": 104,
+   "text": "LiteLLM\nvirtual keys \u00b7 budgets\nper-key spend",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_5",
+   "originalText": "LiteLLM\nvirtual keys \u00b7 budgets\nper-key spend",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_6",
+   "x": 370,
+   "y": 220,
+   "width": 40,
+   "height": 0,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     40,
+     0
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_7",
+   "x": 250,
+   "y": 320,
+   "width": 280,
+   "height": 90,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#b2f2bb",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_7_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_7_t",
+   "x": 256,
+   "y": 328,
+   "width": 268,
+   "height": 74,
+   "text": "= a number",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_7",
+   "originalText": "= a number",
+   "autoResize": true
+  },
+  {
+   "type": "rectangle",
+   "id": "zone_8",
+   "x": 780,
+   "y": 110,
+   "width": 660,
+   "height": 330,
+   "strokeColor": "#d0d0d0",
+   "backgroundColor": "#e5dbff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 1,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   }
+  },
+  {
+   "type": "text",
+   "id": "zt_9",
+   "x": 794,
+   "y": 120,
+   "width": 300,
+   "height": 24,
+   "text": "SUBSCRIPTION QUOTA \u2014 what is LEFT",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "SUBSCRIPTION QUOTA \u2014 what is LEFT",
+   "autoResize": true
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_10",
+   "x": 810,
+   "y": 160,
+   "width": 280,
+   "height": 120,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#d0bfff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_10_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_10_t",
+   "x": 816,
+   "y": 168,
+   "width": 268,
+   "height": 104,
+   "text": "Provider rate-limit\nstate (5h \u00b7 weekly)\nNOT in responses",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_10",
+   "originalText": "Provider rate-limit\nstate (5h \u00b7 weekly)\nNOT in responses",
+   "autoResize": true
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_11",
+   "x": 1130,
+   "y": 160,
+   "width": 280,
+   "height": 120,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#d0bfff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_11_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_11_t",
+   "x": 1136,
+   "y": 168,
+   "width": 268,
+   "height": 104,
+   "text": "gpt-load\nparses Claude + Codex\nquota windows",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_11",
+   "originalText": "gpt-load\nparses Claude + Codex\nquota windows",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_12",
+   "x": 1090,
+   "y": 220,
+   "width": 40,
+   "height": 0,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     40,
+     0
+    ]
+   ],
+   "strokeColor": "#8b5cf6",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_13",
+   "x": 970,
+   "y": 320,
+   "width": 280,
+   "height": 90,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#b2f2bb",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_13_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_13_t",
+   "x": 976,
+   "y": 328,
+   "width": 268,
+   "height": 74,
+   "text": "= remaining %",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_13",
+   "originalText": "= remaining %",
+   "autoResize": true
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_14",
+   "x": 60,
+   "y": 500,
+   "width": 620,
+   "height": 150,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#fff3bf",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_14_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_14_t",
+   "x": 66,
+   "y": 508,
+   "width": 608,
+   "height": 134,
+   "text": "ccusage  \u00b7  ClaudeBar  \u00b7  CodexBar\n\nread LOCAL session JSONL (claude, codex, gemini, opencode)\nreconstructs what you burned \u2014 an estimate, not the truth",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_14",
+   "originalText": "ccusage  \u00b7  ClaudeBar  \u00b7  CodexBar\n\nread LOCAL session JSONL (claude, codex, gemini, opencode)\nreconstructs what you burned \u2014 an estimate, not the truth",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_15",
+   "x": 800,
+   "y": 380,
+   "width": 300,
+   "height": 120,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     -300,
+     120
+    ]
+   ],
+   "strokeColor": "#f59e0b",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid",
+   "strokeStyle": "dashed",
+   "boundElements": [
+    {
+     "id": "arw_15_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "arw_15_t",
+   "x": 607.65,
+   "y": 417.6,
+   "width": 84.7,
+   "height": 18.2,
+   "text": "cross-check",
+   "fontSize": 14,
+   "fontFamily": 1,
+   "strokeColor": "#f59e0b",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "arw_15",
+   "originalText": "cross-check",
+   "autoResize": true,
+   "backgroundColor": "#ffffff"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_16",
+   "x": 740,
+   "y": 500,
+   "width": 640,
+   "height": 150,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#ffd8a8",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_16_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_16_t",
+   "x": 746,
+   "y": 508,
+   "width": 628,
+   "height": 134,
+   "text": "Why both are needed\n\nno tool can see your Claude Max allowance from API payloads\nthe remaining quota lives in Anthropic's / OpenAI's rate-limit state",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_16",
+   "originalText": "Why both are needed\n\nno tool can see your Claude Max allowance from API payloads\nthe remaining quota lives in Anthropic's / OpenAI's rate-limit state",
+   "autoResize": true
+  },
+  {
+   "type": "text",
+   "id": "txt_17",
+   "x": 60,
+   "y": 700,
+   "width": 944.35,
+   "height": 22.1,
+   "text": "Rule of thumb: ccusage tells you how much you burned; ClaudeBar / CodexBar tell you how much is left.",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "Rule of thumb: ccusage tells you how much you burned; ClaudeBar / CodexBar tell you how much is left.",
+   "autoResize": true,
+   "textAlign": "left"
+  }
+ ],
+ "appState": {
+  "viewBackgroundColor": "#ffffff"
+ },
+ "files": {}
+}

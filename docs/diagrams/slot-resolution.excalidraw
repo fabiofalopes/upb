@@ -1,0 +1,427 @@
+{
+ "type": "excalidraw",
+ "version": 2,
+ "source": "hermes-agent",
+ "elements": [
+  {
+   "type": "text",
+   "id": "txt_1",
+   "x": 60,
+   "y": 36,
+   "width": 872.3000000000001,
+   "height": 33.800000000000004,
+   "text": "How a slot resolves \u2014 candidates, then filters, then a winner",
+   "fontSize": 26,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "How a slot resolves \u2014 candidates, then filters, then a winner",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_2",
+   "x": 420,
+   "y": 110,
+   "width": 620,
+   "height": 80,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#fff3bf",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_2_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_2_t",
+   "x": 426,
+   "y": 118,
+   "width": 608,
+   "height": 64,
+   "text": "primary.coding\nintent slot \u2014 a capability, not a model id",
+   "fontSize": 18,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_2",
+   "originalText": "primary.coding\nintent slot \u2014 a capability, not a model id",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_3",
+   "x": 730,
+   "y": 190,
+   "width": 0,
+   "height": 50,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     50
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_4",
+   "x": 300,
+   "y": 240,
+   "width": 860,
+   "height": 150,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#a5d8ff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_4_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_4_t",
+   "x": 306,
+   "y": 248,
+   "width": 848,
+   "height": 134,
+   "text": "CANDIDATES  \u2014  the slot's own preference order\n\nprefer:   deepseek/deepseek-v4-pro \u00b7 zhipuai/glm-5.2 \u00b7 minimax/MiniMax-M3\nfallback: zhipuai/glm-5-turbo \u00b7 moonshotai/kimi-k2.7-code",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_4",
+   "originalText": "CANDIDATES  \u2014  the slot's own preference order\n\nprefer:   deepseek/deepseek-v4-pro \u00b7 zhipuai/glm-5.2 \u00b7 minimax/MiniMax-M3\nfallback: zhipuai/glm-5-turbo \u00b7 moonshotai/kimi-k2.7-code",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_5",
+   "x": 730,
+   "y": 390,
+   "width": 0,
+   "height": 60,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     60
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_6",
+   "x": 300,
+   "y": 450,
+   "width": 860,
+   "height": 150,
+   "strokeColor": "#06b6d4",
+   "backgroundColor": "#c3fae8",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_6_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_6_t",
+   "x": 306,
+   "y": 458,
+   "width": 848,
+   "height": 134,
+   "text": "FILTERS  \u2014  a candidate must pass ALL of them\n\n1  capability contract     tools \u00b7 context \u2265 100k \u00b7 reasoning\n2  status                   not deprecated \u00b7 provider routable\n3  price ceiling            input \u2264 $3.00 / M  (output is separate)",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_6",
+   "originalText": "FILTERS  \u2014  a candidate must pass ALL of them\n\n1  capability contract     tools \u00b7 context \u2265 100k \u00b7 reasoning\n2  status                   not deprecated \u00b7 provider routable\n3  price ceiling            input \u2264 $3.00 / M  (output is separate)",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_7",
+   "x": 730,
+   "y": 600,
+   "width": 0,
+   "height": 50,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     50
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_8",
+   "x": 1200,
+   "y": 470,
+   "width": 300,
+   "height": 110,
+   "strokeColor": "#ef4444",
+   "backgroundColor": "#ffc9c9",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_8_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_8_t",
+   "x": 1206,
+   "y": 478,
+   "width": 288,
+   "height": 94,
+   "text": "rejected\nfails a filter\n\u2014 reported, not silent",
+   "fontSize": 15,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_8",
+   "originalText": "rejected\nfails a filter\n\u2014 reported, not silent",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_9",
+   "x": 1160,
+   "y": 520,
+   "width": 40,
+   "height": 0,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     40,
+     0
+    ]
+   ],
+   "strokeColor": "#ef4444",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid",
+   "strokeStyle": "dashed"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_10",
+   "x": 300,
+   "y": 650,
+   "width": 520,
+   "height": 140,
+   "strokeColor": "#1e1e1e",
+   "backgroundColor": "#b2f2bb",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_10_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_10_t",
+   "x": 306,
+   "y": 658,
+   "width": 508,
+   "height": 124,
+   "text": "WINNER  \u2014  first survivor\n\nalibaba/glm-5.2\nthe binding key \u2014 never a raw model id",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_10",
+   "originalText": "WINNER  \u2014  first survivor\n\nalibaba/glm-5.2\nthe binding key \u2014 never a raw model id",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_11",
+   "x": 820,
+   "y": 720,
+   "width": 60,
+   "height": 0,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     60,
+     0
+    ]
+   ],
+   "strokeColor": "#22c55e",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_12",
+   "x": 880,
+   "y": 650,
+   "width": 520,
+   "height": 140,
+   "strokeColor": "#ef4444",
+   "backgroundColor": "#ffc9c9",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_12_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_12_t",
+   "x": 886,
+   "y": 658,
+   "width": 508,
+   "height": 124,
+   "text": "UNRESOLVED  \u2014  and it says why\n\nno binding satisfies the slot\nrequires: tools, ctx \u2265 100k",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_12",
+   "originalText": "UNRESOLVED  \u2014  and it says why\n\nno binding satisfies the slot\nrequires: tools, ctx \u2265 100k",
+   "autoResize": true
+  },
+  {
+   "type": "text",
+   "id": "txt_13",
+   "x": 880,
+   "y": 800,
+   "width": 429.00000000000006,
+   "height": 19.5,
+   "text": "reached only when no candidate survives every filter",
+   "fontSize": 15,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "reached only when no candidate survives every filter",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_14",
+   "x": 60,
+   "y": 880,
+   "width": 654.5,
+   "height": 22.1,
+   "text": "Every step is inspectable:  upb registry resolve primary.coding --json",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "Every step is inspectable:  upb registry resolve primary.coding --json",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_15",
+   "x": 60,
+   "y": 906,
+   "width": 972.4000000000001,
+   "height": 22.1,
+   "text": "reports the tier, the reference it matched, and every candidate it considered \u2014 and why the losers lost.",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "reports the tier, the reference it matched, and every candidate it considered \u2014 and why the losers lost.",
+   "autoResize": true,
+   "textAlign": "left"
+  }
+ ],
+ "appState": {
+  "viewBackgroundColor": "#ffffff"
+ },
+ "files": {}
+}

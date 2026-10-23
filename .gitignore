@@ -10,3 +10,7 @@ router.env
 !*.env.example
 .DS_Store
 docs/reference/scratch/
+
+# Diagram SVG renders are intermediates of render.py; the .png renders are
+# tracked so the markdown renders without a build step.
+docs/diagrams/*.svg

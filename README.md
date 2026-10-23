@@ -48,6 +48,35 @@ back on the way in, including streaming SSE. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design (translation
 layer, streaming pipeline, auth model, retry logic).
 
+## The model registry
+
+Provider model ids churn. `deepseek-v4-pro` becomes `deepseek-v4-pro:0813`;
+`glm-5.1` becomes `glm-5.3`; models vanish. An audit of this repo's own config
+against live provider catalogues found **13 of 47 declared bindings were not
+served**.
+
+So routes never name a model directly. Three layers keep the churn contained:
+
+```
+  slots{}      intent     primary.coding, primary.reasoning, cheap.scratch
+  models{}     identity   deepseek/deepseek-v4-pro, zhipuai/glm-5.2
+  bindings{}   served at  ollama-cloud/deepseek-v4-pro:0813   ← churn lives here
+```
+
+Status (`active` / `backup` / `deprecated` / `unknown`) lives on the
+**binding**, never on the model — the same model can be dead at one provider
+and live at another.
+
+```console
+upb registry build     # merge routes.yaml + models.dev + live catalogues
+upb registry drift     # what changed upstream (exit 3 on findings)
+upb registry resolve primary.coding --json
+upb snapshot           # what was I running at time T
+```
+
+See [docs/REGISTRY.md](docs/REGISTRY.md) for the design, the file format, and
+the operating runbook.
+
 ## Quick start
 
 Requirements: Linux, **Node.js 22+**, **Python 3.10+** with `yaml`. The

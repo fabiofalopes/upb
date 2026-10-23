@@ -1,0 +1,508 @@
+{
+ "type": "excalidraw",
+ "version": 2,
+ "source": "hermes-agent",
+ "elements": [
+  {
+   "type": "text",
+   "id": "txt_1",
+   "x": 60,
+   "y": 36,
+   "width": 829.4000000000001,
+   "height": 33.800000000000004,
+   "text": "Canonical registry \u2014 three layers, so a rename touches one",
+   "fontSize": 26,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "Canonical registry \u2014 three layers, so a rename touches one",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "zone_2",
+   "x": 330,
+   "y": 120,
+   "width": 760,
+   "height": 110,
+   "strokeColor": "#d0d0d0",
+   "backgroundColor": "#fff3bf",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 1,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   }
+  },
+  {
+   "type": "text",
+   "id": "zt_3",
+   "x": 344,
+   "y": 130,
+   "width": 300,
+   "height": 24,
+   "text": "Intent \u2014 capability contracts",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "Intent \u2014 capability contracts",
+   "autoResize": true
+  },
+  {
+   "type": "text",
+   "id": "txt_4",
+   "x": 350,
+   "y": 166,
+   "width": 551.6500000000001,
+   "height": 22.1,
+   "text": "primary.coding   primary.reasoning   cheap.scratch   vision",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "primary.coding   primary.reasoning   cheap.scratch   vision",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_5",
+   "x": 350,
+   "y": 194,
+   "width": 300.3,
+   "height": 18.2,
+   "text": "asks for a CAPABILITY, never a model id",
+   "fontSize": 14,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "asks for a CAPABILITY, never a model id",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "zone_6",
+   "x": 330,
+   "y": 300,
+   "width": 760,
+   "height": 110,
+   "strokeColor": "#d0d0d0",
+   "backgroundColor": "#c3fae8",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 1,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   }
+  },
+  {
+   "type": "text",
+   "id": "zt_7",
+   "x": 344,
+   "y": 310,
+   "width": 300,
+   "height": 24,
+   "text": "Identity \u2014 canonical model",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "Identity \u2014 canonical model",
+   "autoResize": true
+  },
+  {
+   "type": "text",
+   "id": "txt_8",
+   "x": 350,
+   "y": 346,
+   "width": 589.0500000000001,
+   "height": 22.1,
+   "text": "deepseek/deepseek-v4-pro   zhipuai/glm-5.2   minimax/MiniMax-M3",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "deepseek/deepseek-v4-pro   zhipuai/glm-5.2   minimax/MiniMax-M3",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_9",
+   "x": 350,
+   "y": 374,
+   "width": 554.4000000000001,
+   "height": 18.2,
+   "text": "provider-agnostic; survives renames. 85% of models.dev entries carry one",
+   "fontSize": 14,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "provider-agnostic; survives renames. 85% of models.dev entries carry one",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "zone_10",
+   "x": 330,
+   "y": 480,
+   "width": 760,
+   "height": 110,
+   "strokeColor": "#d0d0d0",
+   "backgroundColor": "#a5d8ff",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 1,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   }
+  },
+  {
+   "type": "text",
+   "id": "zt_11",
+   "x": 344,
+   "y": 490,
+   "width": 300,
+   "height": 24,
+   "text": "Served at \u2014 provider binding",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "Served at \u2014 provider binding",
+   "autoResize": true
+  },
+  {
+   "type": "text",
+   "id": "txt_12",
+   "x": 350,
+   "y": 526,
+   "width": 607.75,
+   "height": 22.1,
+   "text": "ollama-cloud/deepseek-v4-pro:0813   alibaba/glm-5.2   zai/glm-5.3",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "ollama-cloud/deepseek-v4-pro:0813   alibaba/glm-5.2   zai/glm-5.3",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_13",
+   "x": 350,
+   "y": 554,
+   "width": 508.20000000000005,
+   "height": 18.2,
+   "text": "THE CHURNY LAYER \u2014 status lives here: active / backup / deprecated",
+   "fontSize": 14,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "THE CHURNY LAYER \u2014 status lives here: active / backup / deprecated",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "zone_14",
+   "x": 330,
+   "y": 660,
+   "width": 760,
+   "height": 110,
+   "strokeColor": "#d0d0d0",
+   "backgroundColor": "#ffd8a8",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 1,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   }
+  },
+  {
+   "type": "text",
+   "id": "zt_15",
+   "x": 344,
+   "y": 670,
+   "width": 300,
+   "height": 24,
+   "text": "Endpoint \u2014 provider",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "Endpoint \u2014 provider",
+   "autoResize": true
+  },
+  {
+   "type": "text",
+   "id": "txt_16",
+   "x": 350,
+   "y": 706,
+   "width": 617.1,
+   "height": 22.1,
+   "text": "ollama-cloud   alibaba   zai   mistral   zen   litellm   LM Studio",
+   "fontSize": 17,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "originalText": "ollama-cloud   alibaba   zai   mistral   zen   litellm   LM Studio",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_17",
+   "x": 350,
+   "y": 734,
+   "width": 415.8,
+   "height": 18.2,
+   "text": "keys, billing, trust zone. Key slots, never key values",
+   "fontSize": 14,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "keys, billing, trust zone. Key slots, never key values",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "arrow",
+   "id": "arw_18",
+   "x": 710,
+   "y": 230,
+   "width": 0,
+   "height": 66,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     66
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "arrow",
+   "id": "arw_19",
+   "x": 710,
+   "y": 410,
+   "width": 0,
+   "height": 66,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     66
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "arrow",
+   "id": "arw_20",
+   "x": 710,
+   "y": 590,
+   "width": 0,
+   "height": 66,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     66
+    ]
+   ],
+   "strokeColor": "#4a9eed",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid"
+  },
+  {
+   "type": "text",
+   "id": "txt_21",
+   "x": 60,
+   "y": 150,
+   "width": 79.2,
+   "height": 20.8,
+   "text": "1  INTENT",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "1  INTENT",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_22",
+   "x": 60,
+   "y": 330,
+   "width": 96.80000000000001,
+   "height": 20.8,
+   "text": "2  IDENTITY",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "2  IDENTITY",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_23",
+   "x": 60,
+   "y": 510,
+   "width": 88.0,
+   "height": 20.8,
+   "text": "3  BINDING",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "3  BINDING",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_24",
+   "x": 60,
+   "y": 690,
+   "width": 96.80000000000001,
+   "height": 20.8,
+   "text": "4  ENDPOINT",
+   "fontSize": 16,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "4  ENDPOINT",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "rectangle",
+   "id": "shape_25",
+   "x": 1140,
+   "y": 470,
+   "width": 250,
+   "height": 130,
+   "strokeColor": "#ef4444",
+   "backgroundColor": "#ffc9c9",
+   "fillStyle": "solid",
+   "roughness": 1,
+   "strokeWidth": 2,
+   "opacity": 100,
+   "roundness": {
+    "type": 3
+   },
+   "boundElements": [
+    {
+     "id": "shape_25_t",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "shape_25_t",
+   "x": 1146,
+   "y": 478,
+   "width": 238,
+   "height": 114,
+   "text": "Provider renames it:\ndeepseek-v4-pro\n\u2192  deepseek-v4-pro:0813",
+   "fontSize": 15,
+   "fontFamily": 1,
+   "strokeColor": "#1e1e1e",
+   "textAlign": "center",
+   "verticalAlign": "middle",
+   "containerId": "shape_25",
+   "originalText": "Provider renames it:\ndeepseek-v4-pro\n\u2192  deepseek-v4-pro:0813",
+   "autoResize": true
+  },
+  {
+   "type": "arrow",
+   "id": "arw_26",
+   "x": 1140,
+   "y": 535,
+   "width": 45,
+   "height": 0,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     -45,
+     0
+    ]
+   ],
+   "strokeColor": "#ef4444",
+   "strokeWidth": 2,
+   "roughness": 1,
+   "endArrowhead": "arrow",
+   "fillStyle": "solid",
+   "strokeStyle": "dashed"
+  },
+  {
+   "type": "text",
+   "id": "txt_27",
+   "x": 1140,
+   "y": 610,
+   "width": 123.75000000000001,
+   "height": 19.5,
+   "text": "one line to fix",
+   "fontSize": 15,
+   "fontFamily": 1,
+   "strokeColor": "#ef4444",
+   "originalText": "one line to fix",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_28",
+   "x": 330,
+   "y": 810,
+   "width": 717.7500000000001,
+   "height": 19.5,
+   "text": "sources:  models.dev (facts)  \u00b7  routes.yaml (declared)  \u00b7  live /models (ground truth)",
+   "fontSize": 15,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "sources:  models.dev (facts)  \u00b7  routes.yaml (declared)  \u00b7  live /models (ground truth)",
+   "autoResize": true,
+   "textAlign": "left"
+  },
+  {
+   "type": "text",
+   "id": "txt_29",
+   "x": 330,
+   "y": 836,
+   "width": 577.5,
+   "height": 19.5,
+   "text": "manual decisions \u2014 status, slots, notes, key_slots \u2014 survive a rebuild",
+   "fontSize": 15,
+   "fontFamily": 1,
+   "strokeColor": "#757575",
+   "originalText": "manual decisions \u2014 status, slots, notes, key_slots \u2014 survive a rebuild",
+   "autoResize": true,
+   "textAlign": "left"
+  }
+ ],
+ "appState": {
+  "viewBackgroundColor": "#ffffff"
+ },
+ "files": {}
+}
