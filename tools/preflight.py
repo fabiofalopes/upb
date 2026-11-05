@@ -18,6 +18,7 @@ This is the check that would have caught the default model being plan-locked.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -29,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from entitlement import (credentials_for, load_env_files,  # noqa: E402
                          probe)
 
-CONFIG = Path.home() / ".hermes/config.yaml"
+CONFIG = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "config.yaml"
 
 
 def _yaml():
@@ -111,7 +112,7 @@ def load_cfg():
 
 def tls_for(provider):
     """(ca_cert, verify) for a provider, from its config entry."""
-    cfg = _load_yaml_file(Path.home() / ".hermes/config.yaml") or {}
+    cfg = _load_yaml_file(CONFIG) or {}
     entry = None
     for slug, e in (cfg.get("providers") or {}).items():
         if slug == provider and isinstance(e, dict):
@@ -206,6 +207,38 @@ def check_one(label, provider, model, cfg=None, api_mode=None):
     return last
 
 
+def known_auxiliary_tasks():
+    """The auxiliary tasks the INSTALLED Hermes actually runs.
+
+    Sourced from DEFAULT_CONFIG in the Hermes install, not from a list kept
+    here — the set changes between versions. `auxiliary.web_extract` and
+    `auxiliary.session_search` were real aux slots once; they are now ignored
+    leftovers, and probing them reports a green check for a task that does not
+    exist (or a red one that means nothing). A config block naming a task the
+    runtime dropped is stale config, and saying so is more useful than
+    silently probing it.
+
+    Returns (tasks, stale) — the live task names, and the configured-but-dead
+    ones. Falls back to the user's own keys when the install cannot be read,
+    because "I could not check" must not become "everything is fine".
+    """
+    cfg = load_cfg()
+    configured = sorted((cfg.get("auxiliary") or {}).keys())
+    try:
+        import sys as _sys
+        install = Path.home() / ".hermes/hermes-agent"
+        if str(install) not in _sys.path:
+            _sys.path.insert(0, str(install))
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        known = {k for k, v in (DEFAULT_CONFIG.get("auxiliary") or {}).items()
+                 if isinstance(v, dict)}
+        return known, [t for t in configured if t not in known]
+    except Exception as e:
+        print(f"preflight: cannot read the installed aux task list ({e}); "
+              f"falling back to the config's own keys", file=sys.stderr)
+        return set(configured), []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -216,6 +249,7 @@ def main():
 
     cfg = load_cfg()
     checks = []
+    aux_tasks, stale_aux = known_auxiliary_tasks()
 
     # 1. primary
     m = cfg.get("model") or {}
@@ -223,9 +257,11 @@ def main():
                             m.get("default", "?"), cfg,
                             api_mode=m.get("api_mode")))
 
-    # 2. auxiliary tasks
+    # 2. auxiliary tasks — only the ones this Hermes version actually runs
     for name, entry in sorted((cfg.get("auxiliary") or {}).items()):
         if not isinstance(entry, dict):
+            continue
+        if name not in aux_tasks:
             continue
         checks.append(check_one(f"aux:{name}", entry.get("provider", "?"),
                                 entry.get("model", "?"), cfg))
@@ -281,7 +317,8 @@ def main():
 
     bad = [c for c in checks if not c["ok"]]
     if args.json:
-        print(json.dumps({"checks": checks, "ok": not bad}, indent=2))
+        print(json.dumps({"checks": checks, "ok": not bad,
+                          "stale_auxiliary_blocks": stale_aux}, indent=2))
         return 3 if bad else 0
 
     print("HERMES PRE-FLIGHT")
@@ -296,6 +333,13 @@ def main():
         print(line)
     print("=" * 60)
     print(f"  {len(checks)-len(bad)}/{len(checks)} working")
+    if stale_aux:
+        # Not a failure — a block the runtime no longer reads. Left in place it
+        # keeps looking like a configured, monitored aux task forever.
+        print("\n  stale auxiliary blocks (ignored by this Hermes version):")
+        for t in stale_aux:
+            print(f"    auxiliary.{t} — not an aux task here; "
+                  f"remove with: hermes config unset auxiliary.{t}")
     if bad and args.fix_suggest:
         print("\nSuggested repairs:")
         for c in bad:
