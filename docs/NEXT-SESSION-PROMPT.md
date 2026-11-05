@@ -38,9 +38,9 @@ zai/glm-5.3-flash, ollama-cloud's free models), or something else you
 prefer. Ask me if you need to know more first.
 
 After that, in priority order:
-1. Commit and push the 11 unpushed commits on branch research/model-registry
-   (read the handoff §0 first — the remote was force-pushed in October, so
-   check before you push).
+1. Push the 12 commits on branch research/model-registry — everything is
+   already committed, only the push is left (read the handoff §0 first; the
+   remote was force-pushed in October, so check before you push).
 2. Implement the biggest missing feature: the health gate can grey models
    out but cannot DISCOVER new upstream models. That is why the Lusofona
    gateway's catalogue rotation (it now serves lfm2-*/lfm3-* instead of the
