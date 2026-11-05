@@ -26,7 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from entitlement import (hermes_credentials, load_env_files, probe)  # noqa: E402
+from entitlement import (credentials_for, load_env_files,  # noqa: E402
+                         probe)
 
 CONFIG = Path.home() / ".hermes/config.yaml"
 
@@ -128,21 +129,27 @@ def tls_for(provider):
     return (ca or None), bool(verify)
 
 
-def cred_for(provider):
-    """Resolve (base_url, key, dialect) for a configured provider name.
+def _dialect_for(provider):
+    if provider.endswith("-anthropic"):
+        return "anthropic_messages"
+    if provider == "openai-codex":
+        return "codex_responses"
+    return "chat_completions"
 
-    The dialect matters more than it looks: probing openai-codex with a
-    Chat Completions body reports a working model as broken.
+
+def cred_candidates(provider):
+    """Every (base_url, key, label) the runtime could use, best first.
+
+    Ordering matters: a provider can hold several credentials for the same
+    endpoint (a stale manual key and a live env key), and probing only the
+    first reports a working provider as 401. Try them in the order the runtime
+    would, and stop at the first that answers.
     """
-    creds = {c["provider"]: c for c in hermes_credentials()}
+    out = []
+    for c in credentials_for(provider):
+        out.append((c["base_url"], c["key"], f"{c['source']} ({c['label']})"))
     env = load_env_files(Path.home() / ".config/upb/secrets.env",
                          Path.home() / ".hermes/.env")
-    if provider in creds:
-        c = creds[provider]
-        dialect = ("anthropic_messages" if provider.endswith("-anthropic")
-                   else "codex_responses" if provider == "openai-codex"
-                   else "chat_completions")
-        return c["base_url"], c["key"], dialect
     static = {
         "ollama-cloud": ("https://ollama.com/v1", env.get("OLLAMA_API_KEY", "")),
         "zai": ("https://api.z.ai/api/coding/paas/v4", env.get("ZAI_API_KEY", "")),
@@ -150,29 +157,53 @@ def cred_for(provider):
                     env.get("ALIBABA_TOKEN_PLAN_KEY", "")),
         "lmstudio": ("http://127.0.0.1:1234/v1", env.get("LM_API_KEY", "")),
     }
-    if provider in static:
+    if not out and provider in static:
         base, key = static[provider]
-        return base, key, "chat_completions"
+        if key:
+            out.append((base, key, "env"))
+    return out
+
+
+def cred_for(provider):
+    """Resolve (base_url, key, dialect) for a configured provider name.
+
+    The dialect matters more than it looks: probing openai-codex with a
+    Chat Completions body reports a working model as broken.
+    """
+    cands = cred_candidates(provider)
+    if cands:
+        return cands[0][0], cands[0][1], _dialect_for(provider)
     return None, None, "chat_completions"
 
 
 def check_one(label, provider, model, cfg=None, api_mode=None):
-    base, key, dialect = cred_for(provider)
     ca_cert, verify = tls_for(provider)
+    dialect = _dialect_for(provider)
     if api_mode:
         dialect = {"anthropic_messages": "anthropic_messages",
                    "codex_responses": "codex_responses",
                    "openai_chat": "chat_completions",
                    "chat_completions": "chat_completions"}.get(
                        str(api_mode), dialect)
-    if not base:
+    cands = cred_candidates(provider)
+    if not cands:
         return {"label": label, "provider": provider, "model": model,
                 "ok": False, "code": None, "kind": "no-credentials",
-                "detail": f"no base_url/key known for '{provider}'"}
-    ok, code, kind, detail = probe(base, key, model, dialect,
-                                   ca_cert=ca_cert, verify=verify)
-    return {"label": label, "provider": provider, "model": model,
-            "ok": ok, "code": code, "kind": kind, "detail": detail}
+                "detail": f"no base_url/key known for '{provider}'",
+                "credential": None}
+    # Try each credential the runtime could pick, in order. The first that
+    # answers is the one a session would actually use — so a stale manual key
+    # at a lower priority cannot make a working provider look dead.
+    last = None
+    for base, key, via in cands:
+        ok, code, kind, detail = probe(base, key, model, dialect,
+                                       ca_cert=ca_cert, verify=verify)
+        last = {"label": label, "provider": provider, "model": model,
+                "ok": ok, "code": code, "kind": kind, "detail": detail,
+                "credential": via}
+        if ok:
+            return last
+    return last
 
 
 def main():
@@ -206,19 +237,31 @@ def main():
         checks.append(check_one(f"fallback:{i+1}", entry.get("provider", "?"),
                                 entry.get("model", "?"), cfg))
 
-    # 4. local server — LM Studio requires its API token even on /models
+    # 4. local server — LM Studio requires its API token even on /models.
+    #    Use the OpenAI-compatible path: it lists the models actually being
+    #    SERVED, which is the question. The native /api/v1/models can answer
+    #    "0 models" while the port is up, and a listening port with nothing
+    #    loaded is not a working fallback.
     lm_key = load_env_files(Path.home() / ".hermes/.env").get("LM_API_KEY", "")
     try:
         hdrs = {"User-Agent": "preflight/1.0"}
         if lm_key:
             hdrs["Authorization"] = f"Bearer {lm_key}"
-        req = urllib.request.Request("http://127.0.0.1:1234/api/v1/models",
+        req = urllib.request.Request("http://127.0.0.1:1234/v1/models",
                                      headers=hdrs)
-        with urllib.request.urlopen(req, timeout=4) as r:
-            models = json.loads(r.read()).get("data", [])
-        checks.append({"label": "lmstudio", "provider": "lmstudio",
-                       "model": f"{len(models)} model(s) available",
-                       "ok": True, "code": 200, "kind": "ok", "detail": ""})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            models = [m.get("id") for m in json.loads(r.read()).get("data", [])]
+        if models:
+            checks.append({"label": "lmstudio", "provider": "lmstudio",
+                           "model": ", ".join(models)[:40],
+                           "ok": True, "code": 200, "kind": "ok",
+                           "detail": "", "credential": None})
+        else:
+            checks.append({"label": "lmstudio", "provider": "lmstudio",
+                           "model": "127.0.0.1:1234", "ok": False, "code": 200,
+                           "kind": "no-model-loaded",
+                           "detail": "server up but no model loaded",
+                           "credential": None})
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -228,12 +271,13 @@ def main():
         checks.append({"label": "lmstudio", "provider": "lmstudio",
                        "model": "127.0.0.1:1234", "ok": False, "code": e.code,
                        "kind": "auth" if e.code in (401, 403) else "unreachable",
-                       "detail": body or f"HTTP {e.code}"})
+                       "detail": body or f"HTTP {e.code}", "credential": None})
     except Exception as e:
         checks.append({"label": "lmstudio", "provider": "lmstudio",
                        "model": "127.0.0.1:1234", "ok": False, "code": None,
                        "kind": "unreachable",
-                       "detail": f"{type(e).__name__} — no local model server"})
+                       "detail": f"{type(e).__name__} — no local model server",
+                       "credential": None})
 
     bad = [c for c in checks if not c["ok"]]
     if args.json:
@@ -245,6 +289,8 @@ def main():
     for c in checks:
         mark = "✓" if c["ok"] else "✗"
         line = f"  {mark} {c['label']:<22} {c['provider']}/{c['model']}"
+        if c.get("credential"):
+            line += f"  [via {c['credential']}]"
         if not c["ok"]:
             line += f"\n      [{c['kind']}] {c['detail']}"
         print(line)

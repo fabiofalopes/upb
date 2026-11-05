@@ -37,6 +37,58 @@ AUTH = Path.home() / ".hermes/auth.json"
 HERMES_ENV = Path.home() / ".hermes/.env"
 UPB_ENV = Path.home() / ".config/upb/secrets.env"
 UPB_ROUTES = Path.home() / ".config/upb/routes.yaml"
+HERMES_CONFIG = Path.home() / ".hermes/config.yaml"
+
+
+def _verify_flag(value):
+    """ssl_verify may be a bool or one of the string forms Hermes accepts."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "no", "0", "")
+    return True if value is None else bool(value)
+
+
+def _norm_slug(s):
+    """'Modelos.ai.ulusofona.pt', 'modelos-ai-ulusofona-pt' and
+    'modelos.ai.ulusofona.pt' are the same provider spelled three ways across
+    the two config blocks and the credential pool. Compare on a normalised
+    form or a TLS pin silently fails to match and the probe reports a TLS
+    error on a gateway whose CA is pinned correctly."""
+    return (s or "").strip().lower().replace(".", "-").replace("_", "-")
+
+
+def tls_for(pid):
+    """(ca_cert, verify) for a provider, read from BOTH config blocks.
+
+    A provider whose issuer chain is not in the local trust store (the
+    Lusofona gateway is issued by a research CA that neither macOS's keychain
+    nor Python's certifi carries) fails verification with a perfectly valid
+    certificate. The config pins the CA on the provider entry; a probe that
+    ignores `ssl_ca_cert` reports a reachable gateway as a TLS failure and
+    sends you debugging the network instead of the trust store.
+    """
+    cfg = _load_yaml_file(HERMES_CONFIG) or {}
+    entries = []
+    for slug, e in (cfg.get("providers") or {}).items():
+        if isinstance(e, dict):
+            entries.append((slug, e))
+    for e in (cfg.get("custom_providers") or []):
+        if isinstance(e, dict):
+            entries.append((e.get("name") or "", e))
+    want = _norm_slug(pid[7:] if pid.startswith("custom:") else pid)
+    for slug, e in entries:
+        s = _norm_slug(slug)
+        if s == want or (want and (want.endswith(s) or s.endswith(want))):
+            return (e.get("ssl_ca_cert") or None), _verify_flag(e.get("ssl_verify"))
+    return None, True
+
+
+def config_provider_entry(name):
+    """A custom_providers entry by name (case-insensitive), or None."""
+    cfg = _load_yaml_file(HERMES_CONFIG) or {}
+    for e in (cfg.get("custom_providers") or []):
+        if isinstance(e, dict) and _norm_slug(e.get("name")) == _norm_slug(name):
+            return e
+    return None
 
 # provider -> (probe model, dialect)
 PROBE = {
@@ -63,12 +115,12 @@ NOTES = {
     "opencode-zen": "free tier is OpenCode-client-only (403 outside OpenCode)",
     "opencode-go": "requires x-opencode-session header; gpt-5.4 not on this plan",
     "copilot": "gh token works but the account has no Copilot licence",
-    "openai-codex": "OAuth access_token expired — needs `hermes auth refresh`",
+    "openai-codex": "OAuth device-code credential; auto-refreshed 2026-10-30",
     "openai-api": "key points at the Lusofona gateway, not api.openai.com",
     "lmstudio": "server is up but has 0 models loaded",
     "alibaba-coding-plan": "token expired (401) across all alibaba-coding ids",
     "alibaba-token-plan": "token valid, but every model is plan-gated (403)",
-    "custom:modelos.ai.ulusofona.pt": "gateway unreachable from this network",
+    "custom:modelos.ai.ulusofona.pt": "reachable via pinned HARICA CA; the gateway rotated its catalogue, so the declared ids 400",
 }
 
 
@@ -126,6 +178,11 @@ def base_url_for(pid, cred):
     base = (cred.get("base_url") or "").strip()
     if base:
         return base
+    # a custom provider's endpoint lives in the config, not the pool
+    if pid.startswith("custom:"):
+        e = config_provider_entry(pid[7:])
+        if e:
+            return (e.get("base_url") or "").strip()
     routes = _load_yaml_file(UPB_ROUTES)
     if not routes:
         return ""
@@ -217,13 +274,21 @@ def main():
         key = resolve_credential(pid, cred)
         base = base_url_for(pid, cred)
         model, dialect = PROBE.get(pid, ("?", "chat"))
+        # a custom provider's probe model is whatever the config points at —
+        # hard-coding it here is how a catalogue rotation goes unnoticed
+        if pid.startswith("custom:"):
+            e = config_provider_entry(pid[7:]) or {}
+            model = e.get("default_model") or model
+        ca_cert, verify = tls_for(pid)
         if dialect in ("codex", "copilot") or pid == "opencode-go":
             ok, code, kind, detail = probe_special(pid, base, key, model)
             if ok is None:
-                ok, code, kind, detail = probe(base, key, model, "chat")
+                ok, code, kind, detail = probe(base, key, model, "chat",
+                                               ca_cert=ca_cert, verify=verify)
         else:
             dia = "anthropic_messages" if dialect == "anthropic" else "chat_completions"
-            ok, code, kind, detail = probe(base, key, model, dia)
+            ok, code, kind, detail = probe(base, key, model, dia,
+                                           ca_cert=ca_cert, verify=verify)
         if not key:
             # No credential at all — a different problem from a rejected one.
             kind, detail = "no-key", "no credential for this provider"

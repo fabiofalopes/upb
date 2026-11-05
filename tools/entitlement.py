@@ -51,24 +51,71 @@ def load_env_files(*paths):
     return out
 
 
-def hermes_credentials():
-    """Providers from ~/.hermes/auth.json credential pool — the real keys."""
+def hermes_credentials(env=None):
+    """Providers from ~/.hermes/auth.json credential pool — the real keys.
+
+    A pool entry whose literal key is EMPTY is usually not a placeholder but an
+    *env reference*: `source: "env:COMMANDCODE_API_KEY"`, with the real key
+    living in ~/.hermes/.env and the pool holding only a `secret_fingerprint`.
+    Dropping those entries (the old behaviour) makes a provider whose key is
+    env-sourced look like it has no working credential at all — so a stale
+    manual entry at a *lower* priority silently wins and every probe reports a
+    401 on a provider that is, in fact, answering. That is exactly what
+    happened to `commandcode`: the manual `api-key-1` was exhausted, the env
+    key was live, and the pre-flight reported 2/15.
+
+    Resolve the reference from the env files instead of discarding it.
+    """
     try:
         d = json.loads((Path.home() / ".hermes/auth.json").read_text())
     except Exception:
         return []
+    if env is None:
+        env = load_env_files(Path.home() / ".config/upb/secrets.env",
+                             Path.home() / ".hermes/.env")
     out = []
     for pid, creds in (d.get("credential_pool") or {}).items():
         for c in creds:
             key = (c.get("access_token") or c.get("api_key") or "").strip()
             base = c.get("base_url") or ""
-            # A pooled entry with an EMPTY token is a placeholder, not a
-            # credential — it would shadow a working .env key. Skip it.
+            source = c.get("source") or "?"
+            if not key and source.startswith("env:"):
+                # env-sourced credential — resolve the reference, don't drop it
+                key = (env.get(source[4:].strip()) or "").strip()
+            # A pooled entry with an EMPTY token after resolution is a
+            # placeholder, not a credential — it would shadow a working .env
+            # key. Skip it.
             if not key or not base:
                 continue
             out.append({"provider": pid, "base_url": base.rstrip("/"),
-                        "key": key, "source": c.get("source", "?")})
+                        "key": key, "source": source,
+                        "priority": c.get("priority", 0),
+                        "label": c.get("label", source),
+                        "status": (c.get("last_status") or "").lower(),
+                        "id": c.get("id", "")})
     return out
+
+
+# A credential the provider has already rejected is not the one to try first.
+DEAD_STATUSES = {"exhausted", "failed", "revoked", "expired", "banned"}
+
+
+def credential_order(creds):
+    """Sort credentials the way the runtime would pick them.
+
+    Priority first, but a credential whose recorded status is a hard auth
+    failure sinks below a live one — otherwise a stale manual key at priority 0
+    shadows the env key at priority 1 that actually works.
+    """
+    return sorted(creds, key=lambda c: (
+        0 if (c.get("status") or "") not in DEAD_STATUSES else 1,
+        c.get("priority") or 0))
+
+
+def credentials_for(provider, env=None):
+    """Every resolvable credential for one provider, best first."""
+    return credential_order([c for c in hermes_credentials(env)
+                             if c["provider"] == provider])
 
 
 def classify(code, body):
