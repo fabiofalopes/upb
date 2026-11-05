@@ -18,6 +18,7 @@ This is the check that would have caught the default model being plan-locked.
 
 import argparse
 import json
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -71,6 +72,30 @@ class _RemoteYaml:
         pass
 
 
+def _load_yaml_file(path):
+    """Parse a YAML file with whatever interpreter has PyYAML."""
+    try:
+        import yaml
+        return yaml.safe_load(Path(path).read_text())
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    venv = Path.home() / ".hermes/hermes-agent/venv/bin/python3"
+    if not venv.exists():
+        return None
+    out = subprocess.run(
+        [str(venv), "-c",
+         "import yaml,json,sys;print(json.dumps(yaml.safe_load(open(sys.argv[1]).read())))",
+         str(path)], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
 def load_cfg():
     """Parse ~/.hermes/config.yaml. A parse failure is fatal, not silent —
     a swallowed exception here turns "the config is broken" into "nothing is
@@ -83,16 +108,41 @@ def load_cfg():
         raise SystemExit(2)
 
 
+def tls_for(provider):
+    """(ca_cert, verify) for a provider, from its config entry."""
+    cfg = _load_yaml_file(Path.home() / ".hermes/config.yaml") or {}
+    entry = None
+    for slug, e in (cfg.get("providers") or {}).items():
+        if slug == provider and isinstance(e, dict):
+            entry = e
+    if entry is None:
+        for e in (cfg.get("custom_providers") or []):
+            if isinstance(e, dict) and (provider.endswith(e.get("name", ""))):
+                entry = e
+    if not entry:
+        return None, True
+    ca = entry.get("ssl_ca_cert")
+    verify = entry.get("ssl_verify", True)
+    if isinstance(verify, str):
+        verify = verify.strip().lower() not in ("false", "no", "0")
+    return (ca or None), bool(verify)
+
+
 def cred_for(provider):
-    """Resolve (base_url, key, dialect) for a configured provider name."""
+    """Resolve (base_url, key, dialect) for a configured provider name.
+
+    The dialect matters more than it looks: probing openai-codex with a
+    Chat Completions body reports a working model as broken.
+    """
     creds = {c["provider"]: c for c in hermes_credentials()}
     env = load_env_files(Path.home() / ".config/upb/secrets.env",
                          Path.home() / ".hermes/.env")
     if provider in creds:
         c = creds[provider]
-        return c["base_url"], c["key"], ("anthropic_messages"
-                                         if provider.endswith("-anthropic")
-                                         else "chat_completions")
+        dialect = ("anthropic_messages" if provider.endswith("-anthropic")
+                   else "codex_responses" if provider == "openai-codex"
+                   else "chat_completions")
+        return c["base_url"], c["key"], dialect
     static = {
         "ollama-cloud": ("https://ollama.com/v1", env.get("OLLAMA_API_KEY", "")),
         "zai": ("https://api.z.ai/api/coding/paas/v4", env.get("ZAI_API_KEY", "")),
@@ -106,13 +156,21 @@ def cred_for(provider):
     return None, None, "chat_completions"
 
 
-def check_one(label, provider, model, cfg=None):
+def check_one(label, provider, model, cfg=None, api_mode=None):
     base, key, dialect = cred_for(provider)
+    ca_cert, verify = tls_for(provider)
+    if api_mode:
+        dialect = {"anthropic_messages": "anthropic_messages",
+                   "codex_responses": "codex_responses",
+                   "openai_chat": "chat_completions",
+                   "chat_completions": "chat_completions"}.get(
+                       str(api_mode), dialect)
     if not base:
         return {"label": label, "provider": provider, "model": model,
                 "ok": False, "code": None, "kind": "no-credentials",
                 "detail": f"no base_url/key known for '{provider}'"}
-    ok, code, kind, detail = probe(base, key, model, dialect)
+    ok, code, kind, detail = probe(base, key, model, dialect,
+                                   ca_cert=ca_cert, verify=verify)
     return {"label": label, "provider": provider, "model": model,
             "ok": ok, "code": code, "kind": kind, "detail": detail}
 
@@ -131,7 +189,8 @@ def main():
     # 1. primary
     m = cfg.get("model") or {}
     checks.append(check_one("PRIMARY", m.get("provider", "?"),
-                            m.get("default", "?"), cfg))
+                            m.get("default", "?"), cfg,
+                            api_mode=m.get("api_mode")))
 
     # 2. auxiliary tasks
     for name, entry in sorted((cfg.get("auxiliary") or {}).items()):

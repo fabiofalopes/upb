@@ -78,8 +78,41 @@ def classify(code, body):
     return "error", (body or "")[:70]
 
 
-def probe(base, key, model, dialect="chat_completions"):
-    """One 1-token call. Returns (ok, code, kind, detail)."""
+def _ssl_context(ca_cert=None, verify=True):
+    """An SSL context honouring a provider's pinned CA.
+
+    A gateway whose issuer chain is not in the local trust store fails
+    verification even though the cert is perfectly valid (this machine's
+    Lusofona gateway is issued by a Greek research CA that neither macOS's
+    keychain nor Python's certifi carries). Pinning the intermediate as the
+    trust anchor fixes it WITHOUT disabling verification.
+    """
+    import ssl
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif ca_cert:
+        try:
+            ctx.load_verify_locations(ca_cert)
+        except Exception:
+            pass
+    return ctx
+
+
+def probe(base, key, model, dialect="chat_completions", ca_cert=None, verify=True):
+    """One 1-token call. Returns (ok, code, kind, detail).
+
+    Three wire dialects, because the providers do not agree:
+      chat_completions   — OpenAI Chat Completions
+      anthropic_messages — Anthropic Messages
+      codex_responses    — OpenAI Responses, but ONLY with a LIST-shaped
+                           `input` and `stream: true`. A scalar input is
+                           rejected with "Input must be a list" and a
+                           non-streaming request with "Stream must be set to
+                           true" — both of which look like a broken model
+                           when they are really a wrong probe.
+    """
     headers = {"Content-Type": "application/json", "User-Agent": UA,
                "Accept": "application/json"}
     if dialect == "anthropic_messages":
@@ -88,6 +121,14 @@ def probe(base, key, model, dialect="chat_completions"):
         url, body = base + "/messages", {
             "model": model, "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}]}
+    elif dialect == "codex_responses":
+        headers["Authorization"] = f"Bearer {key}"
+        headers["Accept"] = "text/event-stream"
+        url, body = base + "/responses", {
+            "model": model, "store": False, "stream": True,
+            "input": [{"role": "user",
+                       "content": [{"type": "input_text", "text": "hi"}]}],
+            "max_output_tokens": 16}
     else:
         headers["Authorization"] = f"Bearer {key}"
         url, body = base + "/chat/completions", {
@@ -96,6 +137,13 @@ def probe(base, key, model, dialect="chat_completions"):
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers=headers, method="POST")
     try:
+        if ca_cert or not verify:
+            # a pinned CA needs its own context; urlopen's default cannot
+            # take per-request TLS options.
+            ctx = _ssl_context(ca_cert, verify)
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                resp.read(1)
+            return True, 200, "usable", ""
         urllib.request.urlopen(req, timeout=30)
         return True, 200, "usable", ""
     except urllib.error.HTTPError as e:

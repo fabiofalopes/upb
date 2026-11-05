@@ -38,6 +38,7 @@ import argparse
 import json
 import os
 import subprocess
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -108,6 +109,42 @@ def save_yaml(path, data):
 
 # ── the provider surface ───────────────────────────────────────────────
 
+def _load_yaml(path):
+    """Parse a YAML file with whatever interpreter has PyYAML.
+
+    The system python3 on macOS has no PyYAML; the Hermes venv does. This
+    tool must run from a bare `python3 tools/health_gate.py`, so it falls back
+    to the venv rather than failing with a bare ModuleNotFoundError.
+    """
+    try:
+        import yaml
+        return yaml.safe_load(Path(path).read_text())
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    venv = Path.home() / ".hermes/hermes-agent/venv/bin/python3"
+    if not venv.exists():
+        return None
+    out = subprocess.run(
+        [str(venv), "-c",
+         "import yaml,json,sys;print(json.dumps(yaml.safe_load(open(sys.argv[1]).read())))",
+         str(path)], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
+def _verify_flag(value):
+    """ssl_verify may be a bool or the string forms Hermes accepts."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "no", "0", "")
+    return True if value is None else bool(value)
+
+
 def provider_surface():
     """Every provider Hermes knows about, with the models worth probing.
 
@@ -121,11 +158,12 @@ def provider_surface():
 
     out = {}
 
-    def add(slug, base, key, dialect, models):
+    def add(slug, base, key, dialect, models, ca_cert=None, verify=True):
         if not base:
             return
         out[slug] = {"base_url": base.rstrip("/"), "key": key,
-                     "dialect": dialect, "models": list(models)}
+                     "dialect": dialect, "models": list(models),
+                     "ca_cert": ca_cert, "verify": verify}
 
     # 1. every custom provider in the Hermes config
     for entry in (cfg.get("custom_providers") or []):
@@ -137,7 +175,52 @@ def provider_surface():
             continue
         key = (entry.get("api_key") or "").strip()
         models = list((entry.get("models") or {}).keys())
-        add(f"custom:{name}", base, key, "chat", models)
+        add(f"custom:{name}", base, key, "chat", models,
+            ca_cert=entry.get("ssl_ca_cert"),
+            verify=_verify_flag(entry.get("ssl_verify")))
+
+    # 1b. the NEW-STYLE `providers:` block. Hermes converts these to the same
+    # internal custom-provider shape, so the picker treats them identically —
+    # which means the gate must too. A config that migrated from
+    # `custom_providers:` to `providers:` must not silently stop being gated.
+    #
+    # The `providers:` block often carries NO api_key — the credential lives in
+    # a `custom_providers:` entry or the credential pool for the same base_url.
+    # Resolve it by base_url, or the probe 401s on a perfectly good provider.
+    def _norm(u):
+        """Compare base_urls ignoring a trailing /v1 — the same endpoint is
+        spelled both ways across the two config blocks."""
+        u = (u or "").rstrip("/").lower()
+        if u.endswith("/v1"):
+            u = u[:-3]
+        return u
+
+    def _key_for_base(base):
+        want = _norm(base)
+        for e in (cfg.get("custom_providers") or []):
+            if not isinstance(e, dict):
+                continue
+            if _norm(e.get("base_url")) != want:
+                continue
+            k = (e.get("api_key") or "").strip()
+            if k:
+                return k
+        for c in creds.values():
+            if _norm(c.get("base_url")) == want and c.get("key"):
+                return c["key"]
+        return ""
+
+    for slug, entry in (cfg.get("providers") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        base = entry.get("api") or entry.get("base_url") or entry.get("url") or ""
+        if not base:
+            continue
+        key = (entry.get("api_key") or "").strip() or _key_for_base(base)
+        models = list((entry.get("models") or {}).keys())
+        add(slug, base, key, "chat", models,
+            ca_cert=entry.get("ssl_ca_cert"),
+            verify=_verify_flag(entry.get("ssl_verify")))
 
     # 2. providers from the credential pool
     for pid, c in creds.items():
@@ -190,7 +273,9 @@ def scan(surface=None):
 
     def check(slug, spec, model):
         ok, code, kind, detail = probe(spec["base_url"], spec["key"], model,
-                                       spec["dialect"])
+                                       spec["dialect"],
+                                       ca_cert=spec.get("ca_cert"),
+                                       verify=spec.get("verify", True))
         if ok:
             bucket = "selectable"
         elif "was retired" in (detail or "").lower() or \
@@ -255,14 +340,14 @@ def apply_gate(gate, dry_run=False):
     excluded = list((cfg.get("model_catalog") or {}).get("excluded_providers") or [])
 
     changes = []
-    for entry in custom:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
-        slug = f"custom:{name}"
-        g = (gate.get("providers") or {}).get(slug)
+
+    def _gate_for(slug):
+        return (gate.get("providers") or {}).get(slug)
+
+    def _apply_to(entry, slug):
+        g = _gate_for(slug)
         if not g:
-            continue
+            return
         if g["dead"] and not g["selectable"]:
             # every model on this provider is unusable
             new_models = {}
@@ -277,6 +362,21 @@ def apply_gate(gate, dry_run=False):
         if entry.get("discover_models") is not False:
             entry["discover_models"] = False
             changes.append(f"{slug}: discover_models=false (pinned)")
+
+    # the new-style providers: block
+    for slug, entry in (cfg.get("providers") or {}).items():
+        if isinstance(entry, dict):
+            _apply_to(entry, slug)
+
+    for entry in custom:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        slug = f"custom:{name}"
+        g = _gate_for(slug)
+        if not g:
+            continue
+        _apply_to(entry, slug)
 
     cfg["custom_providers"] = custom
     cfg.setdefault("model_catalog", {})["excluded_providers"] = excluded
