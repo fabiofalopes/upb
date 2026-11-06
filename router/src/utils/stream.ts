@@ -347,6 +347,11 @@ export function createKeepaliveStream(
       // no-op
     },
   });
+  // Guard against unhandled 'error' events crashing the process (e.g. when
+  // the upstream source aborts mid-stream). destroy(err) emits 'error' here.
+  keepalive.on('error', (err: Error) => {
+    console.error('[keepalive] stream error:', err?.message);
+  });
 
   // Forward data from source
   source.on('data', (chunk: Buffer) => {
@@ -362,6 +367,10 @@ export function createKeepaliveStream(
   source.on('error', (err: Error) => {
     clearInterval(keepaliveTimer);
     keepalive.destroy(err);
+  });
+
+  keepalive.on('close', () => {
+    clearInterval(keepaliveTimer);
   });
 
   keepaliveTimer = setInterval(() => {

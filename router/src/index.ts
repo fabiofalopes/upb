@@ -470,6 +470,12 @@ async function handleAnthropicRequest(req: http.IncomingMessage, res: http.Serve
 
     const transformer = new AnthropicStreamTransformer(body.model);
     const keepaliveStream = createKeepaliveStream(transformer);
+    // Prevent unhandled 'error' events from crashing the proxy process on
+    // upstream timeouts/aborts (these streams are also piped, but pipe() alone
+    // does not guarantee a listener on every emit path).
+    transformer.on('error', (e: Error) => console.error('[stream] transformer error:', e?.message));
+    keepaliveStream.on('error', (e: Error) => console.error('[stream] keepalive error:', e?.message));
+    res.on('error', (e: Error) => console.error('[stream] res error:', e?.message));
 
     try {
       const providerRes = await fetch(providerUrl, {
@@ -663,6 +669,9 @@ async function forwardToProvider(
           // OpenAI SSE → Anthropic SSE translation needed
           const transformer = new AnthropicStreamTransformer(originalModel);
           const keepaliveStream = createKeepaliveStream(transformer);
+          transformer.on('error', (e: Error) => console.error('[stream] transformer error:', e?.message));
+          keepaliveStream.on('error', (e: Error) => console.error('[stream] keepalive error:', e?.message));
+          res.on('error', (e: Error) => console.error('[stream] res error:', e?.message));
 
           if (providerRes.body) {
             const reader = providerRes.body.getReader();
@@ -702,6 +711,7 @@ async function forwardToProvider(
           }
         } else {
           // Passthrough: provider SSE → client directly
+          res.on('error', (e: Error) => console.error('[openai-stream] res error:', e?.message));
           if (providerRes.body) {
             const reader = providerRes.body.getReader();
             let streamUsageLogged = false;
@@ -875,5 +885,14 @@ function shutdown(signal: string) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Safety net: never let a single unhandled stream/timeout error take down
+// the whole proxy (which serves every client). Log and keep running.
+process.on('uncaughtException', (err: Error) => {
+  console.error('[router] uncaughtException (kept alive):', err?.stack || err?.message);
+});
+process.on('unhandledRejection', (reason: unknown) => {
+  console.error('[router] unhandledRejection (kept alive):', reason);
+});
 
 export { server };
