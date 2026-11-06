@@ -38,15 +38,16 @@ import argparse
 import json
 import os
 import subprocess
-import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from entitlement import (hermes_credentials, load_env_files,  # noqa: E402
-                         probe)
+from entitlement import (_ssl_context, hermes_credentials,  # noqa: E402
+                         load_env_files, probe)
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 CONFIG = HERMES_HOME / "config.yaml"
@@ -152,7 +153,14 @@ def provider_surface():
     """
     env = load_env_files(Path.home() / ".config/upb/secrets.env",
                          Path.home() / ".hermes/.env")
-    creds = {c["provider"]: c for c in hermes_credentials()}
+    # Best credential per provider, not whichever the pool happened to list
+    # last — a stale manual key must not shadow a live env key.
+    from entitlement import credentials_for
+    creds = {}
+    for pid in {c["provider"] for c in hermes_credentials(env)}:
+        best = credentials_for(pid, env)
+        if best:
+            creds[pid] = best[0]
     cfg = _load_yaml(CONFIG) or {}
     routes = _load_yaml(UPB_ROUTES) or {}
 
@@ -324,6 +332,225 @@ def scan(surface=None):
     return gate, rows
 
 
+# ── discovery: what upstream serves that the config does not declare ───
+#
+# The gate could grey a model out but never say "the provider moved and here is
+# its new name". That is why a catalogue rotation left an empty provider
+# instead of a one-line suggestion: `discover_models: false` pins the picker to
+# a list that was correct 13 days ago, and nothing compares that list to what
+# the gateway now serves.
+#
+# Discovery answers the second half of the question. It fetches each provider's
+# `GET /models`, diffs it against the declared list, and — only where something
+# is actually broken — probes the candidates and proposes the ones that answer.
+
+def _writable_slugs():
+    """Provider slugs whose model list this tool can actually rewrite.
+
+    Only a configured provider (`providers:` / `custom_providers:`) has a
+    model list to write. A curated or pool-served provider gets its catalogue
+    from Hermes itself, so proposing an edit there would be a lie.
+    """
+    cfg = _load_yaml(CONFIG) or {}
+    slugs = set((cfg.get("providers") or {}).keys())
+    for e in (cfg.get("custom_providers") or []):
+        if isinstance(e, dict) and e.get("name"):
+            slugs.add(f"custom:{e['name']}")
+    return slugs
+
+
+def fetch_catalogue(spec, timeout=25):
+    """GET /models for one provider. Returns (ids, error).
+
+    A provider that exposes no catalogue is not a fault to shout about — it is
+    simply not discoverable this way, and the row says so.
+    """
+    url = spec["base_url"].rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {spec['key']}", "User-Agent": UA,
+        "Accept": "application/json"})
+    try:
+        ctx = None
+        if spec.get("ca_cert") or not spec.get("verify", True):
+            ctx = _ssl_context(spec.get("ca_cert"), spec.get("verify", True))
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return [], f"HTTP {e.code} on /models"
+    except urllib.error.URLError as e:
+        return [], f"transport: {e.reason}"
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        return [], "no `data` array in /models"
+    ids = [str(m["id"]) for m in data
+           if isinstance(m, dict) and m.get("id")]
+    return ids, None
+
+
+def discover(surface=None, probe_new=True, max_probe=24):
+    """Diff each provider's declared models against what it actually serves."""
+    surface = surface or provider_surface()
+    writable = _writable_slugs()
+    rows = []
+
+    for slug, spec in sorted(surface.items()):
+        declared = list(spec["models"])
+        row = {"provider": slug, "base_url": spec["base_url"],
+               "declared": declared, "live": [], "new": [], "missing": [],
+               "catalogue_error": None, "writable": slug in writable,
+               "proposed": [], "not_usable": []}
+        live, err = fetch_catalogue(spec)
+        if err:
+            row["catalogue_error"] = err
+            rows.append(row)
+            continue
+        live_set, declared_set = set(live), set(declared)
+        row["live"] = live
+        row["new"] = [m for m in live if m not in declared_set]
+        row["missing"] = [m for m in declared if m not in live_set]
+        rows.append(row)
+
+    if not probe_new:
+        return rows
+
+    # Probe the candidates ONLY where something we declare has disappeared from
+    # the catalogue. A provider whose declared list is intact does not need a
+    # proposal: "83 new models available" is noise, "your 14 are gone and these
+    # 4 work" is a decision.
+    for row in rows:
+        if not row["new"] or not row["missing"]:
+            continue
+        spec = surface[row["provider"]]
+        candidates = row["new"][:max_probe]
+
+        def check(m):
+            ok, code, kind, detail = probe(
+                spec["base_url"], spec["key"], m, spec["dialect"],
+                ca_cert=spec.get("ca_cert"), verify=spec.get("verify", True))
+            return {"model": m, "ok": ok, "code": code, "kind": kind,
+                    "detail": (detail or "")[:80]}
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(check, candidates))
+        row["proposed"] = [r for r in results if r["ok"]]
+        row["not_usable"] = [r for r in results if not r["ok"]]
+    return rows
+
+
+def _entry_for(cfg, slug):
+    """The config entry a slug writes to, or None."""
+    if slug.startswith("custom:"):
+        for e in (cfg.get("custom_providers") or []):
+            if isinstance(e, dict) and e.get("name") == slug[7:]:
+                return e
+        return None
+    e = (cfg.get("providers") or {}).get(slug)
+    return e if isinstance(e, dict) else None
+
+
+def adopt_discovery(rows, dry_run=False):
+    """Append the proposed models to their provider's entry.
+
+    Also repoints `default_model` when the configured one is among the models
+    the provider no longer serves — otherwise adopting the new catalogue still
+    leaves the provider selecting a dead default.
+    """
+    cfg = _load_yaml(CONFIG) or {}
+    changes = []
+
+    for row in rows:
+        if not row.get("writable"):
+            continue
+        proposed = [p["model"] for p in (row.get("proposed") or [])]
+        served = set(row["live"])
+        declared = set(row["declared"])
+        unusable = {r["model"] for r in (row.get("not_usable") or [])}
+        # a replacement we can actually stand behind: probed OK, else one the
+        # provider still serves that we already declare and have not seen fail
+        replacement = proposed[0] if proposed else next(
+            (m for m in row["live"]
+             if m in declared and m not in unusable), None)
+
+        entry = _entry_for(cfg, row["provider"])
+        if entry is None:
+            if proposed:
+                changes.append(f"{row['provider']}: configured but not found — skipped")
+            continue
+
+        models = entry.get("models") or {}
+        added = [m for m in proposed if m not in models]
+        if added:
+            for m in added:
+                models[m] = {}
+            entry["models"] = models
+            changes.append(f"{row['provider']}: +{len(added)} model(s) → "
+                           f"{', '.join(added)}")
+
+        # Repoint the selected model when the provider no longer serves it. The
+        # two config blocks name the field differently: `custom_providers:`
+        # uses `model`, `providers:` uses `default_model`.
+        #
+        # The test is against the LIVE catalogue, not `missing`. A selected
+        # model can name something that was never in the declared list at all
+        # (the Lusofona entry pointed at qwopus3.5-9b-coder while declaring 14
+        # other ids), so a declared-vs-served diff cannot see it.
+        #
+        # Guarded on a non-empty catalogue: if /models could not be read, every
+        # id would look dead and this would repoint a healthy provider.
+        live = set(row["live"])
+        for field in ("default_model", "model"):
+            current = entry.get(field)
+            if not current or not live or current in live:
+                continue
+            if replacement:
+                entry[field] = replacement
+                changes.append(f"{row['provider']}: {field} "
+                               f"{current} → {replacement} (not served)")
+            else:
+                changes.append(f"{row['provider']}: {field} {current} is not "
+                               f"served and no working replacement was found")
+
+    if dry_run:
+        return changes, cfg
+    if changes:
+        ok = save_yaml(CONFIG, cfg)
+        if not ok:
+            return changes + ["config write FAILED"], None
+    return changes, cfg
+
+
+def print_discovery(rows):
+    """Human-readable diff: declared vs served, per provider."""
+    proposed_any = False
+    for row in sorted(rows, key=lambda r: r["provider"]):
+        if row["catalogue_error"]:
+            continue
+        if not row["new"] and not row["missing"]:
+            continue
+        print(f"\n  {row['provider']}")
+        print(f"    served {len(row['live'])}, declared {len(row['declared'])}")
+        if row["missing"]:
+            shown = ", ".join(row["missing"][:6])
+            more = f" (+{len(row['missing'])-6})" if len(row["missing"]) > 6 else ""
+            print(f"    no longer served ({len(row['missing'])}): {shown}{more}")
+        if row["new"]:
+            shown = ", ".join(row["new"][:8])
+            more = f" (+{len(row['new'])-8})" if len(row["new"]) > 8 else ""
+            print(f"    served but undeclared ({len(row['new'])}): {shown}{more}")
+        if row["proposed"]:
+            proposed_any = True
+            print(f"    → usable now ({len(row['proposed'])}): "
+                  f"{', '.join(p['model'] for p in row['proposed'])}")
+        elif row["missing"] and row["new"]:
+            print("    → none of the new ids answered a probe")
+        if not row["writable"]:
+            print("    (not a config-configured provider — report only)")
+    if not proposed_any:
+        print("\n  no provider needs a catalogue update")
+
+
 # ── applying the gate ──────────────────────────────────────────────────
 
 def apply_gate(gate, dry_run=False):
@@ -394,9 +621,35 @@ def main():
     ap.add_argument("--scan", action="store_true", help="probe everything and refresh the gate")
     ap.add_argument("--show", action="store_true", help="show the current gate")
     ap.add_argument("--apply", action="store_true", help="write the gate into the Hermes config")
+    ap.add_argument("--discover", action="store_true",
+                    help="diff declared models against the provider's live /models and "
+                         "propose the ones that work")
+    ap.add_argument("--adopt", action="store_true",
+                    help="with --discover: write the proposed models into the config")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    if args.discover:
+        rows = discover()
+        if args.json:
+            print(json.dumps({"discovery": rows}, indent=2, sort_keys=True))
+        else:
+            print("DISCOVERY — declared models vs what each provider serves")
+            print_discovery(rows)
+            unreachable = [r for r in rows if r["catalogue_error"]]
+            if unreachable:
+                print("\n  no catalogue endpoint (skipped):")
+                for r in unreachable:
+                    print(f"    {r['provider']}: {r['catalogue_error']}")
+        if args.adopt:
+            changes, _ = adopt_discovery(rows, dry_run=args.dry_run)
+            print("\nmodels adopted:" if not args.dry_run else "\nmodels would be adopted:")
+            for c in changes:
+                print(f"  {c}")
+            if not changes:
+                print("  (nothing to adopt)")
+        return 0
 
     if args.scan:
         gate, rows = scan()
