@@ -19,6 +19,15 @@
 #   upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
 #   upb default                     show the default route
 #   upb doctor                      config, keys, ports, binaries, hygiene
+#   upb keys [PROVIDER]             key status (names + present/missing, never values)
+#   upb keys set VAR                add/replace one provider key — hidden prompt,
+#                                   paste-safe, stored to secrets.env (600), then
+#                                   pushed to router.env + service restart + verify
+#   upb keys del VAR                remove a stored key (backup kept)
+#   upb enable|disable PROVIDER --reason "why"
+#                                   flip enabled in routes.yaml (backup + audit log);
+#                                   disable = quarantine when a provider is down
+#   upb history [--json]            recorded health/keys/config-change history
 #
 # Model truth (invariant): every provider's valid model list IS its live
 # /models endpoint — discovered at runtime, validated at run time, never
@@ -47,6 +56,23 @@ Usage:
   upb stop [ROUTE | --all]        stop proxies spawned by upb (never systemd's)
   upb default                     show the default route
   upb doctor                      config, keys, ports, binaries, hygiene
+  upb keys [PROVIDER]             key status (names + present/missing, never values)
+  upb keys set VAR                add/replace one key — hidden prompt (paste-safe,
+                                  never echoed); stored chmod 600, pushed to
+                                  router.env, service restarted, then verified
+  upb keys del VAR                remove a stored key (backup of prior file kept)
+  upb enable PROVIDER --reason .. enable a provider (records the reason)
+  upb disable PROVIDER --reason .. quarantine a saturated/dead provider
+  upb history [--json]            recorded health, key and config-change history
+
+Quick copy-paste examples:
+  upb status                        # what is up right now (all providers)
+  upb verify --probe                # test the keys for real (1-token calls)
+  upb keys set ZAI_API_KEY         # prompted: paste key, it is never displayed
+  upb keys                          # which keys exist / are missing (names only)
+  upb disable zen --reason "free tier saturated, 429/503 on all models"
+  upb enable zen --reason "recovered, probes green"
+  upb history                       # what went down / came back, and when
 
 Model truth (invariant): every provider's valid model list IS its live
 /models endpoint — discovered at runtime, validated at run time, never
@@ -61,8 +87,10 @@ Exit codes: 0 ok · 2 config/usage error · 3 no eligible route / verify finding
             · 4 spawn failed"""
 
 import argparse
+import getpass
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -675,10 +703,27 @@ def write_session_binding(env, route):
         f"# UPB session binding — written by `upb run {fmt_route_name(route)}`",
         f"# {datetime.now().isoformat(timespec='seconds')}",
     ]
-    # Core routing vars
+    # Core routing vars (pins incl. role tiers) + harness env that must
+    # survive into sub-sessions via the claude wrapper (UI truth: role keys,
+    # context gauge, unknown-model window, thinking budget, timeouts).
     for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+                "ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
+                "MAX_THINKING_TOKENS", "API_TIMEOUT_MS",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"):
         if key in env:
+            lines.append(f"{key}={env[key]}")
+    # Display-name surface (picker labels) — _NAME/_DESCRIPTION companions
+    # and the custom-model option row.
+    for key in env:
+        if key.startswith("ANTHROPIC_") and (
+                key.endswith("_MODEL_NAME") or key.endswith("_MODEL_DESCRIPTION")
+                or key == "ANTHROPIC_CUSTOM_MODEL_OPTION"
+                or key.startswith("ANTHROPIC_CUSTOM_MODEL_OPTION_")):
             lines.append(f"{key}={env[key]}")
     # Model identity for diagnostics
     lines.append(f"UPB_BOUND_ROUTE={fmt_route_name(route)}")
@@ -879,6 +924,14 @@ def cmd_status(cfg, args):
     with ThreadPoolExecutor(max_workers=6) as ex:
         for pname, key_ok, desc, state, detail in ex.map(probe, list(provs)):
             results[pname] = (key_ok, desc, state, detail)
+
+    # Record the health sweep (statuses only — no keys, no models) so
+    # "what was up and when" survives the command exiting.
+    audit_log("health_check", command="status",
+              healthy=sum(1 for v in results.values() if v[2] in ("healthy", "reachable")),
+              total=len(results),
+              states={p: v[2] for p, v in results.items()},
+              key_ok={p: bool(v[0]) for p, v in results.items()})
 
     cds = router_cooldowns(cfg)
 
@@ -1146,7 +1199,8 @@ def cmd_doctor(cfg, args):
     import re
     check("no inline secrets in routes.yaml",
           not re.search(r"(sk-[A-Za-z0-9_\-]{16,})|(key:\s*['\"]?sk-)", raw))
-    legacy = sorted(p.name for p in Path("~/bin").expanduser().glob("claude-*"))
+    legacy = sorted(p.name for p in Path("~/bin").expanduser().glob("claude-*")
+                if p.name not in ("claude-health",))
     check("legacy claude-* launchers removed", not legacy,
           f"{len(legacy)} remain: {', '.join(legacy[:6])}{'…' if len(legacy) > 6 else ''}" if legacy else "")
     # systemd-managed proxy awareness
@@ -1302,6 +1356,16 @@ def cmd_verify(cfg, args):
         for pname, res in ex.map(lambda p: (p, check(p)), list(provs)):
             results[pname] = res
 
+    audit_log("health_check", command="verify" + ("+probe" if args.probe else ""),
+              healthy=sum(1 for r in results.values()
+                          if "error" not in r and "skipped" not in r),
+              total=len(results),
+              states={p: ("error" if "error" in r else
+                          "skipped" if "skipped" in r else
+                          "degraded" if any(s != 200 for s in (r.get("probe") or {}).values())
+                          else "healthy")
+                      for p, r in results.items()})
+
     missing_total = (sum(len(r.get("missing_upstream") or []) for r in results.values())
                      + sum(len(r.get("stale_pins") or []) for r in results.values()))
     error_count = sum(1 for r in results.values() if "error" in r)
@@ -1341,6 +1405,26 @@ def cmd_verify(cfg, args):
 
 # ── env ──────────────────────────────────────────────────────────────
 
+# ── audit log (keys/health/config-change history — never stores secret values) ──
+
+AUDIT_LOG = Path(os.environ.get("UPB_AUDIT_LOG",
+                                "~/.local/share/upb/audit.jsonl")).expanduser()
+
+
+def audit_log(event, **fields):
+    """Append one JSONL event to the local audit log (0600). Best-effort."""
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+               "event": event}
+        rec.update(fields)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        AUDIT_LOG.chmod(0o600)
+    except OSError:
+        pass    # audit logging must never break a command
+
+
 def cmd_env(cfg, args):
     """Print shell-exportable env vars pointing at the persistent router.
     Usage: eval $(upb env)  |  source <(upb env)"""
@@ -1358,6 +1442,260 @@ def cmd_env(cfg, args):
     print(f"export ANTHROPIC_AUTH_TOKEN={secret}")
     print(f"export OPENAI_BASE_URL={base_url}/v1")
     print(f"export OPENAI_API_KEY={secret}")
+    return 0
+
+
+# ── keys / enable / disable / history ────────────────────────────────
+
+def cmd_keys(cfg, args):
+    """Key status and key management. Values are prompted for (hidden,
+    paste-safe), stored to secrets.env (0600), never displayed."""
+    action = getattr(args, "action", None)
+
+    if not action:
+        # Status: names + present/missing only, never values.
+        audit_log("keys_status")
+        print("stored keys (present/missing — values never shown):")
+        missing = []
+        for pname, prov in sorted_providers(cfg):
+            spec = prov.get("key")
+            if spec is None or spec == "none":
+                print(f"  {pname:<16} no key required")
+                continue
+            var = spec.get("var", "?") if isinstance(spec, dict) else "?"
+            value, desc = resolve_key(spec)
+            if value is None:
+                missing.append((pname, var))
+                print(f"  {pname:<16} MISSING ({var}) — add with: upb keys set {var}")
+            else:
+                print(f"  {pname:<16} ok ({var})")
+        if missing:
+            print(f"\n{len(missing)} key(s) missing — set them, then: upb verify --probe")
+            return 3
+        print("\nall configured keys present. verify live validity with: upb verify --probe")
+        return 0
+
+    if action == "set":
+        var = args.var
+        if not var or not var.replace("_", "").isalnum() or not var.isupper():
+            die("key names look like ZAI_API_KEY — letters, digits, underscores, upper case", 2)
+        # Hidden, paste-safe prompt. getpass does not echo; nothing is printed.
+        try:
+            value = getpass.getpass(f"paste the new key for {var} (input hidden): ")
+        except EOFError:
+            die("no input on the prompt — run this in your own terminal, not through a pipe", 2)
+        value = value.strip()
+        if not value:
+            die(f"empty input — {var} unchanged", 2)
+        changed = _secrets_write_var(var, value)
+        print(f"stored {var} (values never shown; file is 0600)")
+        audit_log("key_set", var=var, changed=changed)
+        _keys_push_router_env(cfg)
+        return 0
+
+    if action == "del":
+        var = args.var
+        existed = _secrets_delete_var(var)
+        print(f"removed {var} from secrets.env" if existed else f"{var} was not stored")
+        audit_log("key_delete", var=var, existed=existed)
+        _keys_push_router_env(cfg)
+        return 0
+
+    die(f"unknown keys action '{action}'", 2)
+
+
+def _secrets_write_var(var, value):
+    """Set var in secrets.env, preserving every other line. Backup first.
+    Returns True if the stored value actually changed."""
+    if not SECRETS_PATH.exists():
+        die(f"secrets.env missing ({short_path(SECRETS_PATH)}) — nothing to update", 2)
+    lines = SECRETS_PATH.read_text().splitlines()
+    had = any(l.split("=", 1)[0].strip() == var for l in lines
+              if "=" in l and not l.strip().startswith("#"))
+    old_val = next((l.split("=", 1)[1] for l in lines if l.startswith(f"{var}=")), None)
+    if old_val is not None and old_val.strip().strip("'\"") == value:
+        return False    # already current — no rewrite, no churn
+    _backup_config_files("key change")
+    if had:
+        lines = [f"{var}='{value}'" if l.split("=", 1)[0].strip() == var else l
+                 for l in lines]
+    else:
+        lines.append(f"{var}='{value}'")
+    SECRETS_PATH.write_text("\n".join(lines) + "\n")
+    SECRETS_PATH.chmod(0o600)
+    os.environ[var] = value
+    return True
+
+
+def _secrets_delete_var(var):
+    """Remove var from secrets.env. Returns True if it was there."""
+    if not SECRETS_PATH.exists():
+        return False
+    lines = SECRETS_PATH.read_text().splitlines()
+    kept = [l for l in lines if not (l.split("=", 1)[0].strip() == var and "=" in l
+                                     and not l.strip().startswith("#"))]
+    removed = len(kept) != len(lines)
+    if removed:
+        _backup_config_files("key delete")
+        SECRETS_PATH.write_text("\n".join(kept) + "\n")
+        SECRETS_PATH.chmod(0o600)
+        os.environ.pop(var, None)
+    return removed
+
+
+def _backup_config_files(reason):
+    """Timestamped backup of secrets.env / router.env / routes.yaml before a change."""
+    from datetime import timezone
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    for p in (SECRETS_PATH, ROUTER_ENV, CONFIG_PATH):
+        if p.exists():
+            bak = p.with_name(f"{p.name}.bak-{stamp}")
+            try:
+                shutil.copy2(p, bak)
+                bak.chmod(0o600)
+            except OSError as e:
+                print(f"upb: warning: backup of {short_path(p)} failed: {e}", file=sys.stderr)
+
+
+def _keys_push_router_env(cfg):
+    """Push the key the systemd router is keyed on from secrets.env into
+    router.env and restart the service so a replaced key takes effect
+    immediately. Never prints values."""
+    if not ROUTER_ENV.exists():
+        return
+    import re as _re
+    content = ROUTER_ENV.read_text()
+    m = _re.search(r"^UPB_PROVIDER='?([\w-]+)'?$", content, flags=_re.MULTILINE)
+    pname = m.group(1) if m else None
+    prov = (cfg.get("providers") or {}).get(pname or "")
+    spec = (prov or {}).get("key")
+    var = spec.get("var") if isinstance(spec, dict) else None
+    if not var and pname:
+        # provider name may be an alias of the configured name (e.g. the systemd
+        # router is keyed 'litellm' while the provider is configured as
+        # modelos-ai) — fall back to the conventional variable name.
+        cand = f"{re.sub(r'[^A-Za-z0-9]', '_', pname).upper()}_API_KEY"
+        if cand in os.environ:
+            var = cand
+    if not var:
+        print("upb: warning: cannot map router.env UPB_PROVIDER to a key var — "
+              "router.env left unchanged", file=sys.stderr)
+        return
+    new_val = os.environ.get(var, "")
+    if not new_val:
+        print(f"upb: warning: {var} not resolvable — router.env left unchanged",
+              file=sys.stderr)
+        return
+    new_content = _re.sub(r"^UPB_API_KEY=.*$", f"UPB_API_KEY='{new_val}'",
+                          content, flags=_re.MULTILINE)
+    if new_content != content:
+        ROUTER_ENV.write_text(new_content)
+        ROUTER_ENV.chmod(0o600)
+        print(f"pushed {var} → {short_path(ROUTER_ENV)}")
+        try:
+            subprocess.run(["systemctl", "--user", "restart",
+                            "universal-router.service"], capture_output=True, timeout=15)
+            print("restarted universal-router.service (new key now live)")
+        except Exception as e:
+            print(f"upb: warning: service restart failed: {e}", file=sys.stderr)
+    else:
+        print(f"{short_path(ROUTER_ENV)} already in sync — service NOT restarted")
+    print("verify the new key live with: upb verify --probe")
+
+
+def cmd_enable_disable(cfg, args):
+    """Flip providers.<p>.enabled in routes.yaml, with a recorded reason.
+    This is how a provider is quarantined when it is saturated or dead —
+    it stops appearing in eligible routes and `upb run` refuses it."""
+    pname = args.provider
+    prov = cfg["providers"].get(pname)
+    if not prov:
+        die(f"unknown provider '{pname}' — see: upb list --all", 2)
+    want_enabled = args.cmd == "enable"
+    reason = (args.reason or "").strip()
+    if not reason:
+        die("--reason is required so the change is self-documenting "
+            "(e.g. --reason \"free tier saturated, 429 on all models\")", 2)
+    current = prov.get("enabled", True)
+    if current == want_enabled:
+        print(f"{pname} already {'enabled' if want_enabled else 'disabled'} "
+              f"— no change made")
+        return 0
+    _backup_config_files("provider enable/disable")
+    raw = CONFIG_PATH.read_text()
+    needle = f"\n  {pname}:\n"
+    if needle not in raw:
+        die(f"could not locate provider '{pname}' block in routes.yaml", 2)
+    import re as _re
+    block = _re.compile(rf"(\n  {re.escape(pname)}:\n(?:.{{4}}.*\n)*)")
+    m = block.search(raw)
+    if not m:
+        die(f"could not parse provider '{pname}' block in routes.yaml", 2)
+    body = m.group(1)
+    new_body, n = _re.subn(r"^    enabled: (true|false)[ \t]*$",
+                           lambda mm: f"    enabled: {'true' if want_enabled else 'false'}",
+                           body, count=1, flags=_re.MULTILINE)
+    if n != 1:
+        new_body = body + f"    enabled: {'true' if want_enabled else 'false'}\n"
+    new_raw = raw.replace(body, new_body, 1)
+    # Validate before writing: the new config must still parse as a routes file.
+    try:
+        new_cfg = yaml.safe_load(new_raw)
+        assert isinstance(new_cfg, dict) and "providers" in new_cfg
+    except Exception as e:
+        die(f"refusing to write: edited config failed to validate ({e})", 2)
+    CONFIG_PATH.write_text(new_raw)
+    CONFIG_PATH.chmod(0o600)
+    state = "enabled" if want_enabled else "DISABLED (quarantined)"
+    print(f"{pname}: {state} — reason recorded: {reason}")
+    audit_log("provider_enabled" if want_enabled else "provider_disabled",
+              provider=pname, reason=reason)
+    print(f"verify health and re-check eligibility: upb status · upb list --all")
+    return 0
+
+
+def cmd_history(cfg, args):
+    """Print the recorded history: health checks, key changes, config changes.
+    Secrets were never written to this log — only names and events."""
+    if not AUDIT_LOG.exists():
+        print("no history recorded yet (health checks and key/config changes "
+              "append to this log automatically)")
+        return 0
+    rows = []
+    try:
+        for line in AUDIT_LOG.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError as e:
+        die(f"could not read the history log: {e}", 2)
+    if not rows:
+        print("history log is empty")
+        return 0
+    limit = getattr(args, "limit", 50) or 50
+    rows = rows[-limit:]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    for r in rows:
+        ev = r.get("event", "?")
+        ts = r.get("ts", "?")
+        if ev == "health_check":
+            states = r.get("states") or {}
+            down = [p for p, s in states.items() if s not in ("healthy", "reachable")]
+            print(f"{ts}  HEALTH {r.get('command','?')}: {r.get('healthy','?')} healthy / "
+                  f"{r.get('total','?')} checked"
+                  + (f" · NOT healthy: {', '.join(sorted(down))}" if down else ""))
+        elif ev in ("key_set", "key_delete"):
+            print(f"{ts}  {ev.replace('_',' ').upper()}: {r.get('var','?')} "
+                  f"(changed={r.get('changed')}, existed={r.get('existed')})")
+        elif ev in ("provider_enabled", "provider_disabled"):
+            print(f"{ts}  {ev.replace('_',' ').upper()}: {r.get('provider','?')} "
+                  f"— {r.get('reason','(no reason recorded)')}")
+        else:
+            print(f"{ts}  {ev}")
+    print(f"\n{len(rows)} record(s) shown (most recent last). Full history: {AUDIT_LOG}")
     return 0
 
 
@@ -1573,6 +1911,36 @@ def main():
     p_stop.add_argument("--all", action="store_true")
     sub.add_parser("default")
     sub.add_parser("doctor")
+    p_keys = sub.add_parser(
+        "keys", help="key status (names only) / set (hidden prompt) / del",
+        description=("Without ACTION: print which configured keys resolve and which "
+                     "are missing — variable names and present/missing only, values "
+                     "never displayed. 'set VAR' prompts with hidden, paste-safe "
+                     "input and stores the value in secrets.env (chmod 600), backs "
+                     "the file up first, then pushes the key the systemd router is "
+                     "keyed on and restarts it so the change is live immediately. "
+                     "'del VAR' removes a stored key (backup kept). Keys are always "
+                     "referenced by variable name in routes.yaml — never stored "
+                     "there. After any key change run: upb verify --probe"))
+    p_keys.add_argument("action", nargs="?", choices=["set", "del"],
+                        help="omit for status (names + present/missing only)")
+    p_keys.add_argument("var", nargs="?",
+                        help="key variable name, e.g. ZAI_API_KEY (see status output)")
+    p_en = sub.add_parser(
+        "enable", help="enable a provider and record why (undo a quarantine)")
+    p_en.add_argument("provider")
+    p_en.add_argument("--reason", required=True,
+                      help="why this change is being made (recorded in the audit log)")
+    p_dis = sub.add_parser(
+        "disable",
+        help="quarantine a provider (saturated/dead) and record why")
+    p_dis.add_argument("provider")
+    p_dis.add_argument("--reason", required=True,
+                       help="evidence, e.g. \"free tier saturated — 429 on all models\"")
+    p_hist = sub.add_parser(
+        "history", help="show recorded health/key/config-change history")
+    p_hist.add_argument("--json", action="store_true")
+    p_hist.add_argument("--limit", type=int, default=50)
     p_sync = sub.add_parser("sync")
     p_sync.add_argument("--no-discover", action="store_true",
                         help="skip the new-model discovery check")
@@ -1584,7 +1952,9 @@ def main():
     handlers = {"list": cmd_list, "models": cmd_models, "verify": cmd_verify,
                 "status": cmd_status, "run": cmd_run, "stop": cmd_stop,
                 "default": cmd_default, "doctor": cmd_doctor, "sync": cmd_sync,
-                "env": cmd_env}
+                "env": cmd_env, "keys": cmd_keys,
+                "enable": cmd_enable_disable, "disable": cmd_enable_disable,
+                "history": cmd_history}
     # `upb` with no subcommand behaves like `upb list`
     if args.cmd is None:
         args.all = False

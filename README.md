@@ -110,6 +110,33 @@ existing config after backing it up). Full reference in
 | `upb verify [PROVIDER] [--probe] [--json]` | Audit model pins (`default_model`, role keys, `claude_env`) against each provider's live catalog — a retired id is a hard finding; `--probe` adds a 1-token entitlement check (real billable calls on metered models) |
 | `upb sync [--full]` | Pull keys → `secrets.env` → generate/update `router.env` |
 | `upb env` | Print shell exports pointing at the persistent router |
+| `upb keys [PROVIDER]` | Key status — variable names and present/missing only, never values |
+| `upb keys set VAR` | Add/replace one provider key via a hidden, paste-safe prompt (stored `chmod 600`; backups the old file; pushes to `router.env`, restarts the router service, then verify) |
+| `upb keys del VAR` | Remove a stored key (backup kept) |
+| `upb enable PROVIDER --reason "…"` | Enable a provider; the reason is recorded in the audit log |
+| `upb disable PROVIDER --reason "…"` | Quarantine a saturated/dead provider (reason recorded); it stops appearing in eligible routes |
+| `upb history [--json]` | Recorded health/key/config-change history — what went down, why it was quarantined, when it came back |
+
+Copy-paste examples — the fastest safe path for any key or provider change:
+
+```bash
+upb status                                  # what is up right now (all providers)
+upb verify --probe                          # test every key for real (1-token calls)
+upb keys                                  # which keys exist / are missing (names only)
+upb keys set ZAI_API_KEY                   # prompted: paste the key — never displayed
+upb keys set MISTRAL_API_KEY              # same for any provider variable you were told to set
+upb disable zen --reason "free tier saturated, 429 on all models"
+upb enable zen --reason "recovered, probes green"
+upb history                                # what went down / came back, and when
+```
+
+Keys are **never** pasted into chat, logs, or the shell history: `upb keys set`
+prompts with hidden input (getpass), writes to `secrets.env` (`chmod 600`) after
+timestamped backups, pushes the key the systemd router is keyed on, restarts
+`universal-router.service`, and then tells you to run `upb verify --probe`.
+Every key change, provider enable/disable (with its recorded reason), and health
+sweep is appended to a local JSONL audit log (values never stored there) and is
+replayable with `upb history`.
 
 Two commands deserve emphasis:
 
